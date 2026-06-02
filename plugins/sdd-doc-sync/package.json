@@ -1,0 +1,9 @@
+{
+  "name": "sdd-doc-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "轻量级 demo：vibe coding 时把受改代码登记到 todo，Stop 时用强硬结构化提示词逼模型读文件评审并同步文档",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  }
+}
