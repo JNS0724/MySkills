@@ -128,7 +128,24 @@ const runInner = (ctx) => {
     let ledger = loadLedgerFile(ledgerPath)
 
     // INGEST must precede render (§5.3): turn checkoffs into verdicts first.
-    ledger = ingestCheckoffs(ledger, parseTodo(readTodoFile(todoPath)), now, actor)
+    // Tier 0 counter + Tier 1 gate ride here: classify each checkoff syntactically, and
+    // when the gate is on, withhold the clear for a too-short rationale (stays pending).
+    const checkoffStats = { thin: 0, substantive: 0, refsPath: 0, held: 0, total: 0 }
+    const heldPaths = []
+    ledger = ingestCheckoffs(ledger, parseTodo(readTodoFile(todoPath)), now, actor, {
+      gateOn: cfg.rationaleGate,
+      minChars: cfg.rationaleMinChars,
+      onCheckoff: (s) => {
+        checkoffStats.total += 1
+        checkoffStats[s.thin ? "thin" : "substantive"] += 1
+        if (s.refsPath) checkoffStats.refsPath += 1
+        if (s.held) {
+          checkoffStats.held += 1
+          heldPaths.push(s.path)
+        }
+      },
+    })
+    if (checkoffStats.total > 0) diag(stateDir, { event: "checkoff-rationale", ...checkoffStats })
 
     // auto-baseline (cold start) before capture/compute.
     const boot = bootstrapIfEmpty(repoRoot, ledger, cfg, now)
@@ -158,7 +175,7 @@ const runInner = (ctx) => {
     }
 
     const okLedger = writeTextAtomic(ledgerPath, serializeLedger(ledger))
-    const okTodo = writeTextAtomic(todoPath, renderTodo(needs.items, ledger, { meta: needs.meta }))
+    const okTodo = writeTextAtomic(todoPath, renderTodo(needs.items, ledger, { meta: needs.meta, heldPaths }))
     if (!okLedger || !okTodo) diag(stateDir, { event: "write-skipped", okLedger, okTodo })
 
     return {

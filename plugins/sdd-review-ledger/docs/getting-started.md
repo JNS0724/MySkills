@@ -23,7 +23,7 @@
 
 ## 前置条件
 
-- 本机能跑 `node`（开发用 Node 18+）。
+- 本机能跑 `node`：hook 运行时 **Node 18+** 即可；跑测试（`npm test`，脚本用了 glob）需 **Node ≥ 21**。
 - 项目里有 `sdd/` 或 `.sdd/` 目录，change 目录形如：
 
   ```text
@@ -117,10 +117,12 @@ OpenCode adapter 当前监听：
 
 大多数时候它是安静的。
 
+> **默认行为（2026-06 起）**：编辑过程中**不再主动打断**（`SDD_REVIEW_REMINDER_MODE=stop`，默认）。评审推迟到**收尾前的 Stop**（Claude Code 会拦一次请你先评审）+ 下一轮开头的 carry-over 兜底；`.sdd-review-todo.md` 仍每次编辑刷新，且每次代码改动会记一条「变更线索」（改了什么 + 在做哪个任务）喂给 Stop 评审。下表里"编辑时主动提醒"的现象，需把模式切到 `once`（每回合一次）或 `growth` 才会出现。
+
 | 场景 | 现象 |
 | --- | --- |
 | 改了代码，且仓库里有活跃 change-dir | Claude Code 的 PostToolUse additionalContext / OpenCode 的 tool output 里出现一段 `<system-reminder>[SDD-REVIEW: NEEDS-REVIEW]`，列出变了哪些文件 + 候选 change-dir + design 首行 |
-| 同一轮里连续改多个代码/SDD 文件 | 每次相关编辑后都可能主动提醒；相同 pending 集合的瞬时重复提醒会短窗口去重 |
+| 同一轮里连续改多个代码/SDD 文件 | 默认 `stop` 模式下编辑中**不提醒**，统一到 Stop 评审；切到 `once`/`growth` 后相关编辑会主动提醒，相同 pending 集合的瞬时重复会短窗口去重 |
 | 新会话有历史未评审项 | Claude Code 开头收到 carry-over；OpenCode 不改写用户消息，下一次写工具结果仍会提醒，`.sdd-review-todo.md` 持续保留 |
 | 改了 `design.md` / `tasks.md` | 同样进待评审，提醒评审下游是否需要跟进 |
 | 纯格式化 / 改无关函数 | 也会进待评审（良性），agent 一句"仅格式化，无需改文档"勾掉即可 |
@@ -196,6 +198,60 @@ REVIEW（你是唯一语义裁判；下结论前必须先取证，不接受裸�
 | `SDD_REVIEW_BOOTSTRAP_THRESHOLD` | `1` | 空账本扫到 ≥N 个既有文件即 auto-baseline |
 | `SDD_REVIEW_HASH_LEN` | `16` | 内容哈希 hex 前缀长度 |
 | `SDD_REVIEW_RULES_FILE` | repo 根 `sdd-review-rules.md` | **项目自定义评审规则**：指向一个文本规则文件（绝对路径或相对 repo 根）。命中后，其内容会被**限长（≤4KB/60 行）+ 净化**后作为「项目附加规则」段注入**每回合首条完整提醒**，让团队规则真正进入模型上下文（不靠模型自己去 Read）；不设此变量时回退探测 repo 根的 `sdd-review-rules.md`。两者都没有 → 不注入、行为与从前逐字节相同。注入内容只是给模型的指导文本，**不改变清除判定**（清除唯一信号永远是勾选 `.sdd-review-todo.md`）。 |
+| `SDD_REVIEW_REMINDER_MODE` | `stop` | 编辑时的主动提醒节奏：`stop`(默认)=编辑中不打断、评审推迟到 Stop + 下轮 carry-over；`once`=每回合至多一次主动提醒；`growth`=待评审路径集增长时再提醒 |
+| `SDD_REVIEW_CHANGE_NOTE_CAP` | `3` | 每个待评审代码路径保留多少条「变更线索」(改动摘要 + 任务标签)供 Stop 评审参考；`0`=关闭该功能 |
+| `SDD_REVIEW_RATIONALE_GATE` | `off`(关) | **可选的理由门**：设 `1`/`true` 开启后，勾选时若理由太短(见下一行)则**不清账、保持待评审**，并在该行下方提示原因。只卡长度(句法)、不卡词，默认关 |
+| `SDD_REVIEW_RATIONALE_MIN_CHARS` | `8` | 理由门的最小理由长度(trim 后字符数)；仅在 `SDD_REVIEW_RATIONALE_GATE` 开启时生效 |
+
+---
+
+## 评审理由质量：先度量，再（可选）上门槛
+
+工具默认**不强制**理由质量（清除的唯一信号永远是勾选）。这一组能力帮你先看清问题、再按需收紧——三步走，互不依赖：
+
+1. **度量（默认开，零行为风险）**：每次有勾选被 ingest 时，诊断日志 `sdd-review.log.jsonl`（state 目录下）会多一行：
+
+   ```json
+   {"event":"checkoff-rationale","thin":2,"substantive":1,"refsPath":1,"held":0,"total":3}
+   ```
+
+   按会话把 `thin/total` 求和就是"橡皮图章率"。`thin` 沿用既有的过简判定（空 / `ok` / `无关` …），`refsPath` = 理由是否点到了文件名，`held` = 被理由门拦下的条数。无需任何开关。
+
+2. **离线打分（看清各模型差距）**：跑完后用打分台读最终 `.sdd-review-todo.md` 的审计区：
+
+   ```bash
+   node test/eval/score-rationale.js <你的 .sdd-review-todo.md 路径>
+   ```
+
+   输出每条勾选的 `{thin,len,refsPath}` 和一张记分卡（`thinPct`/`refsPathPct`）。它只做**字面**判定、只在测试台跑、**绝不进产品**（有守卫测试保证 `src/` 永不 import 它）。
+
+3. **门槛（可选，默认关）**：确认问题确实严重后再开。开启后，理由短于阈值的勾选**不生效、保持待评审**，该行下方出现一行"理由过简未生效…"提示；**只卡长度**——"经对照无冲突，纯格式化"这类够长的合规理由照样能清，不会因含"无关/格式化"被拦。
+
+   ```powershell
+   # Windows PowerShell（当前会话生效）
+   $env:SDD_REVIEW_RATIONALE_GATE = "1"
+   $env:SDD_REVIEW_RATIONALE_MIN_CHARS = "12"   # 可选，默认 8
+   ```
+
+   ```bash
+   # macOS / Linux
+   export SDD_REVIEW_RATIONALE_GATE=1
+   ```
+
+---
+
+## 在本机跑测试 / 打包（含 Windows）
+
+```bash
+npm install          # 仅装 esbuild(打包用)，运行时无依赖
+npm test             # 跑全部单测 + 集成测(234 项)；需 Node ≥ 21(test 脚本用了 glob)
+npm run build        # 重新打包出 hook.js + opencode.js
+npm run build:check  # 校验发布件与源码字节同步
+```
+
+- Windows 下用 PowerShell 或 cmd 直接 `npm test` 即可（npm 会用系统 shell 跑脚本，glob 由 Node 自己展开，与平台无关）。
+- 若 Node < 21，glob 不展开会显示"0 个测试"——升级 Node，或改跑按目录发现的命令：`node --test test/unit test/integration test/eval`。
+- 想喂真实数据给打分台：先正常用插件跑一段（产出 repo 根的 `.sdd-review-todo.md`），再 `node test/eval/score-rationale.js .sdd-review-todo.md`。
 
 ---
 

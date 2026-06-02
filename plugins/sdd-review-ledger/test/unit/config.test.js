@@ -99,3 +99,11 @@ test("readConfig: changeNoteCap defaults to 3; honors override; 0 disables", () 
   assert.equal(readConfig({ SDD_REVIEW_CHANGE_NOTE_CAP: "5" }).changeNoteCap, 5)
   assert.equal(readConfig({ SDD_REVIEW_CHANGE_NOTE_CAP: "0" }).changeNoteCap, 0, "0 → feature off")
 })
+
+test("readConfig: rationaleGate default OFF; honored; rationaleMinChars default 8", () => {
+  assert.equal(readConfig({}).rationaleGate, false, "the rationale gate is opt-in")
+  assert.equal(readConfig({ SDD_REVIEW_RATIONALE_GATE: "1" }).rationaleGate, true)
+  assert.equal(readConfig({ SDD_REVIEW_RATIONALE_GATE: "true" }).rationaleGate, true)
+  assert.equal(readConfig({}).rationaleMinChars, 8)
+  assert.equal(readConfig({ SDD_REVIEW_RATIONALE_MIN_CHARS: "12" }).rationaleMinChars, 12)
+})

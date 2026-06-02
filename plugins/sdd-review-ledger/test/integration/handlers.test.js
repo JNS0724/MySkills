@@ -613,3 +613,45 @@ test("onPrompt: a review-induced doc leftover surfaces once next turn, then stop
     rm(root)
   }
 })
+
+// ─── Tier 1: opt-in min-length rationale gate (withhold the clear on a thin checkoff) ───
+test("rationale gate (opt-in): a thin checkoff is WITHHELD (stays pending) + a held note explains why", () => {
+  const root = mkRepo()
+  const env = { SDD_REVIEW_RATIONALE_GATE: "1" }
+  try {
+    write(root, "src/a.ts", "v1")
+    run(ectx(root)) // baseline bootstrap records a.ts
+    write(root, "src/a.ts", "v2")
+    run(ectx(root, { editedPath: path.join(root, "src/a.ts") })) // a.ts pending; todo lists it
+    const todoP = todoPathFor(root)
+    const before = fs.readFileSync(todoP, "utf8")
+    const hit = before.match(/- \[ \] (src\/a\.ts@[0-9a-f]+)/)
+    assert.ok(hit, "a.ts is pending before the checkoff")
+    // model ticks it off with a thin rationale "ok"
+    fs.writeFileSync(todoP, before.replace(/- \[ \] src\/a\.ts@[0-9a-f]+.*/, `- [x] ${hit[1]} — ok`))
+    const r = run(ectx(root, { env }))
+    assert.ok(r.needs.some((n) => n.path === "src/a.ts"), "thin checkoff withheld → a.ts still pending")
+    assert.ok(fs.readFileSync(todoP, "utf8").includes("理由过简未生效"), "todo explains why it stayed pending")
+  } finally {
+    rm(root)
+  }
+})
+
+test("rationale gate: an evidence-bearing rationale clears normally even with the gate ON", () => {
+  const root = mkRepo()
+  const env = { SDD_REVIEW_RATIONALE_GATE: "1" }
+  try {
+    write(root, "src/a.ts", "v1")
+    run(ectx(root))
+    write(root, "src/a.ts", "v2")
+    run(ectx(root, { editedPath: path.join(root, "src/a.ts") }))
+    const todoP = todoPathFor(root)
+    const before = fs.readFileSync(todoP, "utf8")
+    const hit = before.match(/- \[ \] (src\/a\.ts@[0-9a-f]+)/)
+    fs.writeFileSync(todoP, before.replace(/- \[ \] src\/a\.ts@[0-9a-f]+.*/, `- [x] ${hit[1]} — a.ts 已对照 design 无冲突`))
+    const r = run(ectx(root, { env }))
+    assert.ok(!r.needs.some((n) => n.path === "src/a.ts"), "long evidence-bearing rationale clears under the gate")
+  } finally {
+    rm(root)
+  }
+})

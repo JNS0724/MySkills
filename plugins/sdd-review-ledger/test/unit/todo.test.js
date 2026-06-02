@@ -113,6 +113,20 @@ test("renderTodo: bootstrap auto-baseline is NOT marked '理由过简' (only hum
   assert.ok(!line.includes(THIN_MARK), "auto-baseline (empty rationale) must NOT be nagged to supplement a reason")
 })
 
+// Tier 1: held marker on a pending line whose checkoff the gate withheld this run.
+test("renderTodo: heldPaths adds an INERT '↳' note under the pending line; the line still parses", () => {
+  const needs = [{ path: "src/a.ts", currentHash: "aaaa", candidates: [] }]
+  const out = renderTodo(needs, emptyLedger(), { heldPaths: ["src/a.ts"] })
+  assert.ok(out.includes("理由过简未生效"), "the held note explains why it stayed pending")
+  const a = parseTodo(out).find((e) => e.path === "src/a.ts")
+  assert.ok(a && !a.checked && a.inlineHash === "aaaa", "the pending line above is still checkable (note is parse-inert)")
+})
+
+test("renderTodo: no heldPaths → byte-identical to the default render", () => {
+  const needs = [{ path: "src/a.ts", currentHash: "aaaa", candidates: ["g"] }]
+  assert.equal(renderTodo(needs, emptyLedger(), { heldPaths: [] }), renderTodo(needs, emptyLedger()))
+})
+
 test("renderTodo: scan-budget truncation surfaces a non-silent header warning (R1 §4.4)", () => {
   const needs = [{ path: "src/a.ts", currentHash: "aaaa", candidates: ["greeting"] }]
   const led = emptyLedger()

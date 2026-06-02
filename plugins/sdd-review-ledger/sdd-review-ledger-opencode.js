@@ -108,6 +108,7 @@ var require_config = __commonJS({
     var DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
     var DEFAULT_BOOTSTRAP_THRESHOLD = 1;
     var DEFAULT_CHANGE_NOTE_CAP = 3;
+    var DEFAULT_RATIONALE_MIN_CHARS = 8;
     var DEFAULT_REMINDER_MODE = "stop";
     var REMINDER_MODES = /* @__PURE__ */ new Set(["stop", "once", "growth"]);
     var DISABLE_VALUES = /* @__PURE__ */ new Set(["0", "false", "off", "disabled", "disable"]);
@@ -140,7 +141,9 @@ var require_config = __commonJS({
       ignoreGlobs: parseListEnv(env.SDD_REVIEW_IGNORE),
       scanRoots: parseListEnv(env.SDD_REVIEW_SCAN_ROOTS),
       rulesFile: String(env.SDD_REVIEW_RULES_FILE || "").trim() || null,
-      changeNoteCap: parseIntEnv(env.SDD_REVIEW_CHANGE_NOTE_CAP, DEFAULT_CHANGE_NOTE_CAP)
+      changeNoteCap: parseIntEnv(env.SDD_REVIEW_CHANGE_NOTE_CAP, DEFAULT_CHANGE_NOTE_CAP),
+      rationaleGate: isTruthyFlag(env.SDD_REVIEW_RATIONALE_GATE),
+      rationaleMinChars: parseIntEnv(env.SDD_REVIEW_RATIONALE_MIN_CHARS, DEFAULT_RATIONALE_MIN_CHARS)
     });
     module.exports = {
       DEFAULT_HASH_LEN,
@@ -151,6 +154,7 @@ var require_config = __commonJS({
       DEFAULT_MAX_FILE_BYTES,
       DEFAULT_BOOTSTRAP_THRESHOLD,
       DEFAULT_CHANGE_NOTE_CAP,
+      DEFAULT_RATIONALE_MIN_CHARS,
       DEFAULT_REMINDER_MODE,
       REMINDER_MODES,
       DISABLE_VALUES,
@@ -710,6 +714,9 @@ var require_prompts = __commonJS({
     var { sanitizePath } = require_paths();
     var HEADER = "[SDD-REVIEW: NEEDS-REVIEW]";
     var REVIEW_BLOCK = [
+      "\u793A\u4F8B\uFF08\u7167\u6B64\u683C\u5F0F\uFF1A\u5148\u53D6\u8BC1\uFF0C\u518D\u5230\u300C\u5F85\u8BC4\u5BA1\u300D\u533A\u628A [ ] \u6539\u6210 [x] \u5E76\u9644\u4F9D\u636E\uFF09\uFF1A",
+      '    - [x] src/greet.ts@ab12 \u2014 design\u8BF4"\u6309\u65F6\u6BB5\u8FD4\u56DE\u95EE\u5019" / code\u505A"\u5DF2\u6309 hour \u5206\u652F\u8FD4\u56DE" \u2192 \u4E00\u81F4',
+      '    - [x] sdd/changes/x/tasks.md@cd34 \u2014 \u53E6\u4E00\u7BC7 design\u8BF4"\u9700 marker" / \u672C\u6587\u6863\u5DF2\u5217\u540C\u4E00 marker \u2192 \u4E00\u81F4',
       "REVIEW\uFF08\u4F60\u662F\u552F\u4E00\u8BED\u4E49\u88C1\u5224\uFF1B\u4E0B\u7ED3\u8BBA\u524D\u5FC5\u987B\u5148\u53D6\u8BC1\uFF0C\u4E0D\u63A5\u53D7\u88F8\u5224\u65AD\uFF09:",
       "  \u5BF9\u6BCF\u4E00\u9879\uFF0C\u5148\u8BFB\u5F53\u524D\u5185\u5BB9\uFF0C\u518D\u6309\u6B64\u7ED3\u6784\u7ED9\u51FA\u4E8B\u5B9E\uFF0C\u6700\u540E\u624D\u4E0B\u7ED3\u8BBA\uFF1A",
       "    1. design/tasks \u6B64\u523B\u58F0\u79F0\u4EC0\u4E48\uFF08\u5F15\u7528\u5177\u4F53\u4E00\u53E5/\u4E00\u6BB5\uFF09",
@@ -1041,47 +1048,6 @@ var require_change_note = __commonJS({
   }
 });
 
-// src/core/ingest.js
-var require_ingest = __commonJS({
-  "src/core/ingest.js"(exports, module) {
-    "use strict";
-    var { classifyPath } = require_classify();
-    var { withRecord } = require_ledger();
-    var RATIONALE_MAX = 200;
-    var clamp = (s, max) => String(s == null ? "" : s).slice(0, max);
-    var labelFromRationale = (rationale) => {
-      const r = String(rationale || "").toLowerCase();
-      if (/unrelated/.test(r) || /无关/.test(r)) return "unrelated";
-      if (/no[- ]?change|gofmt|format|lint/.test(r) || /仅格式|无需改/.test(r)) return "no-change";
-      if (/synced?|updated?/.test(r) || /已同步|已更新/.test(r)) return "synced";
-      return "reviewed";
-    };
-    var ingestCheckoffs = (ledger, todoEntries, now, actor) => {
-      let next = ledger;
-      for (const e of todoEntries) {
-        if (!e.checked) continue;
-        if (classifyPath(e.path) === "other") continue;
-        next = withRecord(next, e.path, {
-          kind: classifyPath(e.path),
-          reviewedHash: e.inlineHash,
-          // ★ pin to inline hash, not current hash
-          verdict: labelFromRationale(e.rationale),
-          rationale: clamp(e.rationale, RATIONALE_MAX),
-          reviewedAt: now,
-          by: actor || "agent"
-        });
-      }
-      return next;
-    };
-    module.exports = {
-      RATIONALE_MAX,
-      clamp,
-      labelFromRationale,
-      ingestCheckoffs
-    };
-  }
-});
-
 // src/core/todo.js
 var require_todo = __commonJS({
   "src/core/todo.js"(exports, module) {
@@ -1117,6 +1083,7 @@ var require_todo = __commonJS({
     var THIN_RATIONALES = /* @__PURE__ */ new Set(["", "\u65E0\u5173", "ok", "n/a", "na", "\u65E0", "skip"]);
     var isThinRationale = (rationale) => THIN_RATIONALES.has(String(rationale || "").trim().toLowerCase());
     var THIN_MARK = "\uFF08\u7406\u7531\u8FC7\u7B80\uFF0C\u5EFA\u8BAE\u8865\u5145\uFF09";
+    var HELD_NOTE = "\u21B3 \u4E0A\u6B21\u52FE\u9009\u7406\u7531\u8FC7\u7B80\u672A\u751F\u6548\uFF08\u4ECD\u4E3A\u5F85\u8BC4\u5BA1\uFF09\uFF1A\u8865\u4E00\u53E5\u542B\u7B2C 3 \u6B65\u4F9D\u636E\u7684\u7406\u7531\u540E\u91CD\u65B0\u52FE\u9009";
     var renderTodo = (needs, ledger, opts = {}) => {
       const reviewedLimit = opts.reviewedLimit || DEFAULT_REVIEWED_LIMIT;
       const meta = opts.meta || {};
@@ -1124,11 +1091,13 @@ var require_todo = __commonJS({
       if (meta.scanTruncated) lines.push(truncationWarning(meta.skipped || 0));
       lines.push("");
       lines.push(PENDING_HEADING);
+      const heldSet = new Set(Array.isArray(opts.heldPaths) ? opts.heldPaths : []);
       const pending = [...needs].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
       for (const item of pending) {
         const candidates = Array.isArray(item.candidates) ? item.candidates.join(", ") : "";
         const tail = candidates ? `  (\u5019\u9009: ${candidates})` : "";
         lines.push(`- [ ] ${sanitizePath(item.path)}@${item.currentHash}${tail}`);
+        if (heldSet.has(item.path)) lines.push(`  ${HELD_NOTE}`);
       }
       lines.push("", REVIEWED_HEADING);
       const records = ledger && ledger.records ? ledger.records : {};
@@ -1153,10 +1122,93 @@ var require_todo = __commonJS({
       REVIEWED_HEADING,
       DEFAULT_REVIEWED_LIMIT,
       THIN_MARK,
+      HELD_NOTE,
       TODO_LINE,
       parseTodo,
       renderTodo,
       isThinRationale
+    };
+  }
+});
+
+// src/core/ingest.js
+var require_ingest = __commonJS({
+  "src/core/ingest.js"(exports, module) {
+    "use strict";
+    var path = __require("path");
+    var { classifyPath } = require_classify();
+    var { withRecord } = require_ledger();
+    var { isThinRationale } = require_todo();
+    var RATIONALE_MAX = 200;
+    var clamp = (s, max) => String(s == null ? "" : s).slice(0, max);
+    var labelFromRationale = (rationale) => {
+      const r = String(rationale || "").toLowerCase();
+      if (/unrelated/.test(r) || /无关/.test(r)) return "unrelated";
+      if (/no[- ]?change|gofmt|format|lint/.test(r) || /仅格式|无需改/.test(r)) return "no-change";
+      if (/synced?|updated?/.test(r) || /已同步|已更新/.test(r)) return "synced";
+      return "reviewed";
+    };
+    var basenameToken = (p) => {
+      try {
+        return path.posix.basename(String(p || "")).toLowerCase();
+      } catch {
+        return "";
+      }
+    };
+    var rationaleStats = (rationale, p) => {
+      const text = String(rationale == null ? "" : rationale);
+      const token = basenameToken(p);
+      return {
+        thin: isThinRationale(rationale),
+        len: text.trim().length,
+        refsPath: token.length >= 2 && text.toLowerCase().includes(token),
+        verdict: labelFromRationale(rationale)
+      };
+    };
+    var passesRationaleGate = (rationale, minChars) => {
+      try {
+        return String(rationale == null ? "" : rationale).trim().length >= (minChars || 0);
+      } catch {
+        return true;
+      }
+    };
+    var ingestCheckoffs = (ledger, todoEntries, now, actor, opts = {}) => {
+      const onCheckoff = typeof opts.onCheckoff === "function" ? opts.onCheckoff : null;
+      const gateOn = !!opts.gateOn;
+      const minChars = opts.minChars || 0;
+      let next = ledger;
+      for (const e of todoEntries) {
+        if (!e.checked) continue;
+        if (classifyPath(e.path) === "other") continue;
+        const stats = rationaleStats(e.rationale, e.path);
+        const held = gateOn && !passesRationaleGate(e.rationale, minChars);
+        if (onCheckoff) {
+          try {
+            onCheckoff({ path: e.path, held, ...stats });
+          } catch {
+          }
+        }
+        if (held) continue;
+        next = withRecord(next, e.path, {
+          kind: classifyPath(e.path),
+          reviewedHash: e.inlineHash,
+          // ★ pin to inline hash, not current hash
+          verdict: stats.verdict,
+          rationale: clamp(e.rationale, RATIONALE_MAX),
+          reviewedAt: now,
+          by: actor || "agent"
+        });
+      }
+      return next;
+    };
+    module.exports = {
+      RATIONALE_MAX,
+      clamp,
+      labelFromRationale,
+      basenameToken,
+      rationaleStats,
+      passesRationaleGate,
+      ingestCheckoffs
     };
   }
 });
@@ -1380,7 +1432,22 @@ var require_pipeline = __commonJS({
       }
       try {
         let ledger = loadLedgerFile(ledgerPath);
-        ledger = ingestCheckoffs(ledger, parseTodo(readTodoFile(todoPath)), now, actor);
+        const checkoffStats = { thin: 0, substantive: 0, refsPath: 0, held: 0, total: 0 };
+        const heldPaths = [];
+        ledger = ingestCheckoffs(ledger, parseTodo(readTodoFile(todoPath)), now, actor, {
+          gateOn: cfg.rationaleGate,
+          minChars: cfg.rationaleMinChars,
+          onCheckoff: (s) => {
+            checkoffStats.total += 1;
+            checkoffStats[s.thin ? "thin" : "substantive"] += 1;
+            if (s.refsPath) checkoffStats.refsPath += 1;
+            if (s.held) {
+              checkoffStats.held += 1;
+              heldPaths.push(s.path);
+            }
+          }
+        });
+        if (checkoffStats.total > 0) diag(stateDir, { event: "checkoff-rationale", ...checkoffStats });
         const boot = bootstrapIfEmpty(repoRoot, ledger, cfg, now);
         ledger = boot.ledger;
         if (boot.bootstrapped) diag(stateDir, { event: "auto-baseline", count: boot.count });
@@ -1403,7 +1470,7 @@ var require_pipeline = __commonJS({
           diag(stateDir, { event: "scan-truncated", skipped: needs.meta.skipped });
         }
         const okLedger = writeTextAtomic(ledgerPath, serializeLedger(ledger));
-        const okTodo = writeTextAtomic(todoPath, renderTodo(needs.items, ledger, { meta: needs.meta }));
+        const okTodo = writeTextAtomic(todoPath, renderTodo(needs.items, ledger, { meta: needs.meta, heldPaths }));
         if (!okLedger || !okTodo) diag(stateDir, { event: "write-skipped", okLedger, okTodo });
         return {
           action: boot.bootstrapped ? "bootstrap" : "deliver",

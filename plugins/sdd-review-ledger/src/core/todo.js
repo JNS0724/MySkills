@@ -53,6 +53,11 @@ const parseTodo = (text) => {
 const THIN_RATIONALES = new Set(["", "无关", "ok", "n/a", "na", "无", "skip"])
 const isThinRationale = (rationale) => THIN_RATIONALES.has(String(rationale || "").trim().toLowerCase())
 const THIN_MARK = "（理由过简，建议补充）"
+// Tier 1 held marker: an INERT (non-checkbox) note rendered under a pending line that the
+// rationale gate withheld this run. parseTodo skips it (it does not match TODO_LINE), so
+// the pending line above stays checkable. Emitted ONLY when opts.heldPaths is non-empty,
+// so the default render is byte-identical.
+const HELD_NOTE = "↳ 上次勾选理由过简未生效（仍为待评审）：补一句含第 3 步依据的理由后重新勾选"
 
 // renderTodo(needs, ledger, opts) -> text. Idempotent: same inputs → same bytes.
 // needs: NeedsReviewItem[] (sorted by path). ledger: for the reviewed section.
@@ -66,11 +71,14 @@ const renderTodo = (needs, ledger, opts = {}) => {
 
   // —— 待评审 ——
   lines.push(PENDING_HEADING)
+  const heldSet = new Set(Array.isArray(opts.heldPaths) ? opts.heldPaths : [])
   const pending = [...needs].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
   for (const item of pending) {
     const candidates = Array.isArray(item.candidates) ? item.candidates.join(", ") : ""
     const tail = candidates ? `  (候选: ${candidates})` : ""
     lines.push(`- [ ] ${sanitizePath(item.path)}@${item.currentHash}${tail}`)
+    // Tier 1: explain why a just-checked item is still pending (gate withheld it).
+    if (heldSet.has(item.path)) lines.push(`  ${HELD_NOTE}`)
   }
 
   // —— 已评审 (reviewed = records whose reviewedHash is set; newest first by reviewedAt) ——
@@ -106,6 +114,7 @@ module.exports = {
   REVIEWED_HEADING,
   DEFAULT_REVIEWED_LIMIT,
   THIN_MARK,
+  HELD_NOTE,
   TODO_LINE,
   parseTodo,
   renderTodo,

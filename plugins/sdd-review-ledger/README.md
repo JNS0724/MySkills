@@ -6,7 +6,7 @@ vibe coding 时，**自动化辅助评审** SDD 文档↔文档、代码↔文�
 
 ## 状态
 
-**MVP 已实现（Claude Code + OpenCode 双入口）。** M1 核心纯函数 + M2 管线 + M3 Claude Code 适配器 + M4 OpenCode native adapter 已完成，168 个测试通过。发布件：
+**MVP 已实现（Claude Code + OpenCode 双入口）。** M1 核心纯函数 + M2 管线 + M3 Claude Code 适配器 + M4 OpenCode native adapter 已完成，234 个测试通过。发布件：
 
 - `sdd-review-ledger-hook.js`：Claude Code command hook
 - `sdd-review-ledger-opencode.js`：OpenCode native plugin
@@ -39,3 +39,5 @@ npm run build:check  # 校验发布件与源码同步（字节级）
 ```
 
 源码在 `src/`（CommonJS，无运行时依赖）：`src/core/` 纯逻辑可单测，`src/pipeline.js` 单次运行主干，`src/handlers/` + `src/dispatch.js` + `src/adapters/{claude-code,opencode}/` 平台适配。构建顺序与里程碑见详细设计 §15/§16。
+
+> **评审理由质量**（度量诊断 / 离线打分台 `test/eval/score-rationale.js` / 可选的 min-length 理由门）与全部环境变量开关，见 [`docs/getting-started.md`](./docs/getting-started.md) 的「评审理由质量」「常用开关」两节。`npm test` 需 Node ≥ 21。

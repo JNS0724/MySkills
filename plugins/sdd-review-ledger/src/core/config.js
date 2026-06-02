@@ -14,6 +14,11 @@ const DEFAULT_BOOTSTRAP_THRESHOLD = 1
 // How many recent change-note clues to keep per pending code path (feature 2026-06-02:
 // 给 Stop 评审喂"改了什么 + 在做哪个任务"的线索). 0 → feature off (record nothing).
 const DEFAULT_CHANGE_NOTE_CAP = 3
+// Min-length rationale gate (feature 2026-06-02, Tier 1): when SDD_REVIEW_RATIONALE_GATE
+// is on, a [x] whose rationale is shorter than this (after trim) does NOT clear — the
+// item stays pending. SYNTACTIC length only (no blocklist), so it never contradicts the
+// REVIEW_BLOCK rule that "纯重构/格式化/无关 + 依据" is a valid clear. Default OFF.
+const DEFAULT_RATIONALE_MIN_CHARS = 8
 
 // Active-reminder cadence (基于 2026-06-01 体验报告 §6 + 2026-06-02 提速调整):
 //   stop   — NO mid-turn active reminder. Review is DEFERRED to the end-of-turn Stop
@@ -71,6 +76,8 @@ const readConfig = (env = process.env) => ({
   scanRoots: parseListEnv(env.SDD_REVIEW_SCAN_ROOTS),
   rulesFile: String(env.SDD_REVIEW_RULES_FILE || "").trim() || null,
   changeNoteCap: parseIntEnv(env.SDD_REVIEW_CHANGE_NOTE_CAP, DEFAULT_CHANGE_NOTE_CAP),
+  rationaleGate: isTruthyFlag(env.SDD_REVIEW_RATIONALE_GATE),
+  rationaleMinChars: parseIntEnv(env.SDD_REVIEW_RATIONALE_MIN_CHARS, DEFAULT_RATIONALE_MIN_CHARS),
 })
 
 module.exports = {
@@ -82,6 +89,7 @@ module.exports = {
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_BOOTSTRAP_THRESHOLD,
   DEFAULT_CHANGE_NOTE_CAP,
+  DEFAULT_RATIONALE_MIN_CHARS,
   DEFAULT_REMINDER_MODE,
   REMINDER_MODES,
   DISABLE_VALUES,

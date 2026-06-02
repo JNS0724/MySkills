@@ -14,6 +14,9 @@ const HEADER = "[SDD-REVIEW: NEEDS-REVIEW]"
 // enters the product — it lowers the lowest-effort rubber-stamp path, but carries
 // no DENY force (architecture §10#9). Frozen constant for snapshot stability.
 const REVIEW_BLOCK = [
+  "示例（照此格式：先取证，再到「待评审」区把 [ ] 改成 [x] 并附依据）：",
+  "    - [x] src/greet.ts@ab12 — design说\"按时段返回问候\" / code做\"已按 hour 分支返回\" → 一致",
+  "    - [x] sdd/changes/x/tasks.md@cd34 — 另一篇 design说\"需 marker\" / 本文档已列同一 marker → 一致",
   "REVIEW（你是唯一语义裁判；下结论前必须先取证，不接受裸判断）:",
   "  对每一项，先读当前内容，再按此结构给出事实，最后才下结论：",
   "    1. design/tasks 此刻声称什么（引用具体一句/一段）",

@@ -154,6 +154,17 @@ test("buildStopBlock: byte-stable full output (snapshot contract)", () => {
   assert.equal(buildStopBlock(NEEDS), expected)
 })
 
+// Tier 2: REVIEW_BLOCK front-loads a worked example so weak models copy the format.
+test("REVIEW_BLOCK carries a worked example (code + Layer-A doc) ahead of the abstract rubric", () => {
+  assert.ok(REVIEW_BLOCK.includes("示例"), "labeled example present")
+  assert.ok(REVIEW_BLOCK.includes("- [x] src/greet.ts@"), "a filled code checkoff example")
+  assert.ok(REVIEW_BLOCK.includes("tasks.md@"), "a filled Layer-A doc example")
+  assert.ok(
+    REVIEW_BLOCK.indexOf("示例") < REVIEW_BLOCK.indexOf("REVIEW（你是唯一语义裁判"),
+    "the example is FRONT-loaded (before the abstract 1/2/3/4 rubric)"
+  )
+})
+
 // ─── T2 折中：review 后新增 pending 的短兜底（点名 path@hash，不重灌完整协议）───
 const LEFTOVER = [
   { path: "src/greet.ts", kind: "code", currentHash: "aaaa" },
