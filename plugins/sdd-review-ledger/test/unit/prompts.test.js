@@ -243,3 +243,41 @@ test("buildReminder: truncated project rules append a 'see full file' note", () 
   assert.ok(out.includes(REVIEW_BLOCK))
   assert.ok(out.includes(ACTION_LINE))
 })
+
+// 变更线索 (feature 2026-06-02): the Stop review carries per-path change clues.
+test("buildStopBlock: renders change-note clues under each path when present", () => {
+  const needs = [
+    {
+      path: "src/greet.ts",
+      kind: "code",
+      currentHash: "aaaa",
+      candidates: ["greeting"],
+      notes: [{ at: "t", summary: "Edit +2/-1: «const greet = ...»", task: "实现问候功能" }],
+    },
+  ]
+  const out = buildStopBlock(needs)
+  assert.ok(out.includes("↳ 变更线索: Edit +2/-1"), "the change summary rides next to the path")
+  assert.ok(out.includes("[任务: 实现问候功能]"), "the task tag is shown")
+  assert.ok(out.includes(REVIEW_BLOCK), "notes never displace the frozen protocol")
+})
+
+test("buildStopBlock: no notes → byte-identical to the note-less render (snapshot stable)", () => {
+  const withEmpty = NEEDS.map((n) => ({ ...n, notes: [] }))
+  assert.equal(buildStopBlock(withEmpty), buildStopBlock(NEEDS))
+})
+
+test("buildReminder: also renders change-note clues under each path when present", () => {
+  const needs = [
+    {
+      path: "src/greet.ts",
+      kind: "code",
+      currentHash: "aaaa",
+      candidates: ["greeting"],
+      notes: [{ at: "t", summary: "Write (1 行): «export const greet…»", task: "实现问候功能" }],
+    },
+  ]
+  const out = buildReminder(needs, {})
+  assert.ok(out.includes("↳ 变更线索: Write (1 行)"), "the change summary rides next to the path")
+  assert.ok(out.includes("[任务: 实现问候功能]"), "the task tag is shown")
+  assert.ok(out.includes(REVIEW_BLOCK), "the frozen protocol still rides intact")
+})

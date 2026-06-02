@@ -66,10 +66,12 @@ const bumpBatch = (state) => ({ ...state, batch: (state.batch || 0) + 1 })
 // Pure decision for an active reminder. Returns { remind, state }.
 // remind iff there is something to review, the optional cap is not reached, and the
 // within-turn suppression for the active mode does not apply.
+//   mode "stop"   → NEVER actively remind on edit (always suppressed). Review is
+//                   deferred to the end-of-turn Stop block + next-prompt carry-over.
+//                   The PRODUCT default (set in readConfig); ledger/todo + change-notes
+//                   still refresh on every edit.
 //   mode "once"   → at most one active reminder per turn (suppress every same-turn
-//                   repeat, even path-set growth). The PRODUCT default (set in
-//                   readConfig); growth is still surfaced via the always-written todo
-//                   + Stop/idle sweep + next-prompt carry-over.
+//                   repeat, even path-set growth). The previous default; now opt-in.
 //   mode "growth" → also re-fire when a new path appears (suppress only same-turn
 //                   no-growth repeats). Safety/audit-first.
 // Defaults to "growth" here (the safe, louder direction) for direct/unit callers; the
@@ -80,7 +82,7 @@ const decideReminder = (state, { hasNeeds, maxReminders, pathSet = [], mode = "g
   const lastSet = new Set(cur.lastRemindedPathSet || [])
   const grew = pathSet.some((p) => !lastSet.has(p))
   const sameTurn = cur.lastRemindedBatch !== null && cur.lastRemindedBatch === cur.batch
-  const suppressed = mode === "once" ? sameTurn : sameTurn && !grew
+  const suppressed = mode === "stop" ? true : mode === "once" ? sameTurn : sameTurn && !grew
   const remind = !!hasNeeds && maxReminders > 0 && (cur.sent || 0) < maxReminders && !suppressed
   if (!remind) return { remind: false, state: cur }
   return {

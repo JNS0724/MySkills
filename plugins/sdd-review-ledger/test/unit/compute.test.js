@@ -247,3 +247,34 @@ test("selectReviewLeftover: only needs whose path@hash is absent from the review
   assert.deepEqual(selectReviewLeftover([], baseline), [])
   assert.deepEqual(selectReviewLeftover(undefined, baseline), [])
 })
+
+// 变更线索 (feature 2026-06-02): compute threads a record's changeNotes onto its item.
+test("computeNeedsReview: a surfaced code item carries the record's changeNotes as clues", () => {
+  const root = mkRepo()
+  try {
+    write(root, "src/a.ts", "v2")
+    const led = withRecord(emptyLedger(), "src/a.ts", {
+      kind: "code",
+      reviewedHash: "oldhash", // ≠ current → surfaces
+      verdict: "synced",
+      changeNotes: [{ at: "t", summary: "Edit +1/-0", task: "do X" }],
+    })
+    const item = computeNeedsReview(root, led).items.find((i) => i.path === "src/a.ts")
+    assert.ok(item, "a.ts surfaces (changed since review)")
+    assert.deepEqual(item.notes, [{ at: "t", summary: "Edit +1/-0", task: "do X" }])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("computeNeedsReview: item has NO notes key when the record has none (byte-identical shape)", () => {
+  const root = mkRepo()
+  try {
+    write(root, "src/a.ts", "v1")
+    const item = computeNeedsReview(root, emptyLedger()).items.find((i) => i.path === "src/a.ts")
+    assert.ok(item)
+    assert.ok(!("notes" in item), "absent notes → no key")
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

@@ -40,6 +40,18 @@ const changedLine = (item) => {
   return `  - ${p}`
 }
 
+// 变更线索 (feature 2026-06-02): optional per-item change-note clues for the review.
+// Dynamic + OPTIONAL — an item with no notes yields zero lines, so output stays
+// byte-identical to before. Every field is sanitized (the payload is untrusted).
+const noteLines = (item) => {
+  const notes = item && Array.isArray(item.notes) ? item.notes : []
+  return notes.map((n) => {
+    const summary = sanitizePath((n && n.summary) || "")
+    const task = sanitizePath((n && n.task) || "")
+    return `      ↳ 变更线索: ${summary}${task ? `  [任务: ${task}]` : ""}`
+  })
+}
+
 // 扩展 A+B: optional project-rules addendum. The rules OBJECT (resolved + capped +
 // per-line sanitized by core/rules-file) renders as a dynamic, OPTIONAL segment — same
 // shape as CONTEXT — so the frozen REVIEW_BLOCK/ACTION_LINE never change and the default
@@ -66,7 +78,10 @@ const buildReminder = (needs, designFirstLineByDir = {}, projectRules = null) =>
   const items = [...needs].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 
   const lines = ["<system-reminder>", HEADER, "", "CHANGED (未评审，本批):"]
-  for (const item of items) lines.push(changedLine(item))
+  for (const item of items) {
+    lines.push(changedLine(item))
+    for (const nl of noteLines(item)) lines.push(nl)
+  }
 
   // CONTEXT: design first line per referenced change-dir (sorted, deduped).
   const dirs = new Set()
@@ -133,7 +148,10 @@ const buildStopBlock = (needs) => {
     HEADER,
     `收尾前检测到 ${items.length} 项 SDD 变更尚未评审，请先完成评审再结束本回合：`,
   ]
-  for (const item of items) lines.push(`  - ${sanitizePath(item.path)}`)
+  for (const item of items) {
+    lines.push(`  - ${sanitizePath(item.path)}`)
+    for (const nl of noteLines(item)) lines.push(nl)
+  }
   lines.push("", REVIEW_BLOCK, "", ACTION_LINE)
   return lines.join("\n") + "\n"
 }

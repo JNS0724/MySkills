@@ -4,6 +4,7 @@ const { readConfig } = require("../core/config")
 const { resolveStateDir } = require("../core/state-dir")
 const { resolveSessionKey } = require("../core/session-key")
 const { loadThrottle, saveThrottle, bumpBatch } = require("../core/throttle")
+const { saveLastPrompt } = require("../core/session-context")
 const { buildCarryOver, buildLeftoverCarryOver } = require("../core/prompts")
 const { selectActiveNeeds, selectReviewLeftover } = require("../core/compute")
 const { run } = require("../pipeline")
@@ -21,6 +22,8 @@ const onPrompt = (ctx) => {
   // Keep batch state monotonic for diagnostics / optional caps.
   const stateDir = resolveStateDir(ctx.repoRoot)
   const sessionKey = resolveSessionKey(ctx.event || {}, env, ctx.repoRoot)
+  // 任务标签来源：把本轮触发的用户提示词存一份，供 on-edit 的变更线索打"在做哪个任务"的标签。
+  saveLastPrompt(stateDir, sessionKey, (ctx.event && (ctx.event.prompt || ctx.event.promptText)) || "")
   // Read BEFORE bumping: did the turn that just ended fire an active review?
   const prior = loadThrottle(stateDir, sessionKey)
   const remindedLastTurn = prior.lastRemindedBatch !== null && prior.lastRemindedBatch === prior.batch

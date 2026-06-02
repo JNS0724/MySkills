@@ -76,13 +76,19 @@ const computeNeedsReview = (repoRoot, ledger, cfg = {}) => {
     const h = hashWithCache(repoRoot, relPath, record, scan.hashCache, hashLen)
     if (h === null) continue // deleted between scan and hash → not tracked
     if (h !== (record ? record.reviewedHash : undefined)) {
-      items.push({
+      const item = {
         path: relPath,
         kind: "code",
         currentHash: h,
         candidates: nonArchived,
         reason: reasonFor(record),
-      })
+      }
+      // 变更线索: carry recorded change-notes through to the Stop review. Optional —
+      // absent when none, so the item shape stays byte-identical to before.
+      if (record && Array.isArray(record.changeNotes) && record.changeNotes.length) {
+        item.notes = record.changeNotes
+      }
+      items.push(item)
     }
   }
 

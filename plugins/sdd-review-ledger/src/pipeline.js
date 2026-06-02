@@ -12,7 +12,11 @@ const {
   serializeLedger,
   withRecord,
   trackCodePath,
+  appendChangeNote,
 } = require("./core/ledger")
+const { resolveSessionKey } = require("./core/session-key")
+const { loadLastPrompt } = require("./core/session-context")
+const { buildChangeNote } = require("./core/change-note")
 const { ingestCheckoffs } = require("./core/ingest")
 const { parseTodo, renderTodo } = require("./core/todo")
 const { discoverChangeDirs } = require("./core/change-dirs")
@@ -131,10 +135,21 @@ const runInner = (ctx) => {
     ledger = boot.ledger
     if (boot.bootstrapped) diag(stateDir, { event: "auto-baseline", count: boot.count })
 
-    // CAPTURE: ensure the just-edited code path is tracked (never clobbers a hash).
+    // CAPTURE: ensure the just-edited code path is tracked (never clobbers a hash),
+    // then record a change-note clue (改了什么 + 在做哪个任务) for the Stop review.
     if (ctx.editedPath && classifyPath(ctx.editedPath) === "code") {
       const key = keyFor(repoRoot, ctx.editedPath)
       ledger = trackCodePath(ledger, key, fileMeta(path.join(repoRoot, key)))
+      if (cfg.changeNoteCap > 0) {
+        const sessionKey = resolveSessionKey(ctx.event || {}, env, repoRoot)
+        const note = buildChangeNote({
+          toolName: ctx.event && ctx.event.tool_name,
+          toolInput: ctx.event && ctx.event.tool_input,
+          task: loadLastPrompt(stateDir, sessionKey),
+          now,
+        })
+        ledger = appendChangeNote(ledger, key, note, cfg.changeNoteCap)
+      }
     }
 
     const needs = computeNeedsReview(repoRoot, ledger, cfg)

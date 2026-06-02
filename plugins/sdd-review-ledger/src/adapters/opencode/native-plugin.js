@@ -204,6 +204,8 @@ const SddReviewLedgerOpenCode = async (ctx) => {
       if (!isUserChatMessage(input, output)) return
       const c = baseCtx(ctx, input)
       c.event.hook_event_name = "UserPromptSubmit"
+      // 任务标签来源：把用户消息文本带给 onPrompt，供下次编辑的变更线索打任务标签。
+      c.event.prompt = contentText(output?.parts || output?.message?.content || input?.parts || input?.message?.content)
       try {
         const res = onPrompt(c)
         if (res?.deliver) {

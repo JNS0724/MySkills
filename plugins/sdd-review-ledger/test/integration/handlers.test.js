@@ -26,7 +26,14 @@ const write = (root, rel, c) => {
 const rm = (root) => fs.rmSync(root, { recursive: true, force: true })
 const NOW = "2026-05-31T12:00:00Z"
 const SID = { session_id: "sess-A" }
-const ectx = (root, extra = {}) => ({ repoRoot: root, env: {}, now: NOW, actor: "agent", event: SID, ...extra })
+// The PRODUCT DEFAULT is now reminderMode "stop" (review deferred to the end-of-turn
+// Stop block). These tests exercise the active-reminder MECHANICS (once/growth/T2),
+// which are now opt-in, so ectx defaults env to once mode and merges any per-test env
+// on top. Dedicated tests below cover the new "stop" default explicitly.
+const ectx = (root, extra = {}) => {
+  const env = { SDD_REVIEW_REMINDER_MODE: "once", ...(extra.env || {}) }
+  return { repoRoot: root, now: NOW, actor: "agent", event: SID, ...extra, env }
+}
 
 test("onEdit: first edit with needs delivers a fact-forcing reminder; pipeline wrote todo", () => {
   const root = mkRepo()
@@ -97,7 +104,7 @@ test("onEdit: optional session cap (SDD_REVIEW_SESSION_MAX_REMINDERS=1) → only
   const root = mkRepo()
   try {
     write(root, "src/a.ts", "v1")
-    const env = { SDD_REVIEW_SESSION_MAX_REMINDERS: "1" }
+    const env = { SDD_REVIEW_SESSION_MAX_REMINDERS: "1", SDD_REVIEW_REMINDER_MODE: "once" }
     run({ ...ectx(root), env })
     write(root, "src/a.ts", "v2")
     assert.equal(onEdit({ ...ectx(root), env, editedPath: path.join(root, "src/a.ts") }).deliver, true)
@@ -134,7 +141,7 @@ test("dispatch: PostToolUse Edit → additionalContext JSON; Read → empty", ()
       cwd: root,
       session_id: "sess-A",
     }
-    const parsed = JSON.parse(dispatch(editEvent, {}).stdout)
+    const parsed = JSON.parse(dispatch(editEvent, { SDD_REVIEW_REMINDER_MODE: "once" }).stdout)
     assert.equal(parsed.hookSpecificOutput.hookEventName, "PostToolUse")
     assert.ok(parsed.hookSpecificOutput.additionalContext.includes("[SDD-REVIEW"))
 
@@ -275,6 +282,52 @@ test("once mode: a within-turn-suppressed path is still caught by the end-of-tur
     const blocked = onStop(ectx(root, { stopHookActive: false }))
     assert.equal(blocked.block, true, "turn-end Stop blocks while anything is pending")
     assert.ok(blocked.text.includes("src/b.ts"), "the within-turn-suppressed path is surfaced at turn end")
+  } finally {
+    rm(root)
+  }
+})
+
+// ─── NEW PRODUCT DEFAULT: reminderMode "stop" — review deferred to the Stop block ───
+// Raw ctx with env:{} so the true default (stop) applies, not the once-mode ectx helper.
+const sctx = (root, extra = {}) => ({ repoRoot: root, env: {}, now: NOW, actor: "agent", event: SID, ...extra })
+
+test("stop mode (default): an edit does NOT actively remind; ledger+todo refresh; Stop reviews instead", () => {
+  const root = mkRepo()
+  try {
+    write(root, "src/a.ts", "v1")
+    run(sctx(root)) // baseline
+    write(root, "src/a.ts", "v2")
+    const r = onEdit(sctx(root, { editedPath: path.join(root, "src/a.ts") }))
+    assert.equal(r.deliver, false, "default stop mode: no mid-turn active reminder")
+    assert.ok(fs.readFileSync(todoPathFor(root), "utf8").includes("src/a.ts"), "todo still refreshes on edit")
+    const blocked = onStop(sctx(root, { stopHookActive: false }))
+    assert.equal(blocked.block, true, "review happens at the end-of-turn Stop block")
+    assert.ok(blocked.text.includes("src/a.ts"))
+  } finally {
+    rm(root)
+  }
+})
+
+test("change-note: a prompt's task + the edit's summary surface as clues in the Stop review", () => {
+  const root = mkRepo()
+  try {
+    write(root, "src/a.ts", "v1")
+    run(sctx(root)) // baseline a.ts
+    // a user turn states the task → stashed for the task tag
+    onPrompt(sctx(root, { event: { session_id: "sess-A", prompt: "实现问候功能" } }))
+    // then the model edits the code (Write of new content)
+    const content = "export const greet = () => 'hi'"
+    write(root, "src/a.ts", content)
+    onEdit(
+      sctx(root, {
+        editedPath: path.join(root, "src/a.ts"),
+        event: { session_id: "sess-A", tool_name: "Write", tool_input: { content } },
+      })
+    )
+    const blocked = onStop(sctx(root, { stopHookActive: false }))
+    assert.equal(blocked.block, true)
+    assert.ok(blocked.text.includes("↳ 变更线索"), "the Stop review carries the change clue")
+    assert.ok(blocked.text.includes("[任务: 实现问候功能]"), "and the task tag from the triggering prompt")
   } finally {
     rm(root)
   }

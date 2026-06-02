@@ -11,14 +11,19 @@ const DEFAULT_SCAN_BUDGET_MS = 1500
 const DEFAULT_REMINDER_DEDUPE_MS = 2000
 const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024 // 2 MiB
 const DEFAULT_BOOTSTRAP_THRESHOLD = 1
+// How many recent change-note clues to keep per pending code path (feature 2026-06-02:
+// 给 Stop 评审喂"改了什么 + 在做哪个任务"的线索). 0 → feature off (record nothing).
+const DEFAULT_CHANGE_NOTE_CAP = 3
 
-// Active-reminder cadence (基于 2026-06-01 体验报告 §6):
-//   once   — at most one active reminder per user turn; later same-turn growth only
-//            updates ledger/todo, with Stop/idle + next-prompt carry-over as backstops
-//            (experience-first; the DEFAULT).
+// Active-reminder cadence (基于 2026-06-01 体验报告 §6 + 2026-06-02 提速调整):
+//   stop   — NO mid-turn active reminder. Review is DEFERRED to the end-of-turn Stop
+//            block (+ next-prompt carry-over backstop). Ledger/todo still refresh on every
+//            edit, and each code change records a change-note clue for that Stop review.
+//            Throughput/experience-first; the PRODUCT DEFAULT.
+//   once   — at most one active reminder per user turn (opt-in; the previous default).
 //   growth — also re-fire when the pending path-set grows in a turn (safety/audit-first).
-const DEFAULT_REMINDER_MODE = "once"
-const REMINDER_MODES = new Set(["once", "growth"])
+const DEFAULT_REMINDER_MODE = "stop"
+const REMINDER_MODES = new Set(["stop", "once", "growth"])
 
 // R2 #1: escape-hatch master switch. Ported from GateGuard's ECC_DISABLE_VALUES.
 const DISABLE_VALUES = new Set(["0", "false", "off", "disabled", "disable"])
@@ -45,7 +50,7 @@ const parseListEnv = (raw) =>
 
 const isTruthyFlag = (raw) => normalizeEnvValue(raw) === "1" || normalizeEnvValue(raw) === "true"
 
-// SDD_REVIEW_REMINDER_MODE → once | growth. Unknown/blank → once (the quiet default).
+// SDD_REVIEW_REMINDER_MODE → stop | once | growth. Unknown/blank → stop (the quiet default).
 const parseReminderMode = (raw) => {
   const v = normalizeEnvValue(raw)
   return REMINDER_MODES.has(v) ? v : DEFAULT_REMINDER_MODE
@@ -65,6 +70,7 @@ const readConfig = (env = process.env) => ({
   ignoreGlobs: parseListEnv(env.SDD_REVIEW_IGNORE),
   scanRoots: parseListEnv(env.SDD_REVIEW_SCAN_ROOTS),
   rulesFile: String(env.SDD_REVIEW_RULES_FILE || "").trim() || null,
+  changeNoteCap: parseIntEnv(env.SDD_REVIEW_CHANGE_NOTE_CAP, DEFAULT_CHANGE_NOTE_CAP),
 })
 
 module.exports = {
@@ -75,6 +81,7 @@ module.exports = {
   DEFAULT_REMINDER_DEDUPE_MS,
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_BOOTSTRAP_THRESHOLD,
+  DEFAULT_CHANGE_NOTE_CAP,
   DEFAULT_REMINDER_MODE,
   REMINDER_MODES,
   DISABLE_VALUES,

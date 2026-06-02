@@ -68,6 +68,14 @@ test("decideReminder: once mode still reminds first-of-turn and re-arms next tur
   assert.equal(next.remind, true, "a new turn re-arms in once mode")
 })
 
+// 6.0 (产品默认): stop 模式——编辑中永不主动提醒，评审推迟到 Stop block
+test("decideReminder: stop mode never reminds, even first-of-turn or across new turns", () => {
+  const first = decideReminder(emptyThrottle(), { hasNeeds: true, maxReminders: 3, pathSet: ["a"], mode: "stop" })
+  assert.equal(first.remind, false, "stop mode: no active reminder on edit, even the first")
+  const next = decideReminder(bumpBatch(first.state), { hasNeeds: true, maxReminders: 3, pathSet: ["a", "b"], mode: "stop" })
+  assert.equal(next.remind, false, "a new turn does NOT re-arm in stop mode (review stays deferred)")
+})
+
 test("decideReminder: batch still records the latest reminded batch", () => {
   let s = decideReminder(emptyThrottle(), { hasNeeds: true, maxReminders: 3 }).state
   s = bumpBatch(s) // user turn → batch 1

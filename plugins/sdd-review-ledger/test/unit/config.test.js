@@ -86,9 +86,16 @@ test("readConfig: SDD_REVIEW_RULES_FILE is parsed + trimmed (扩展 A+B); blank 
   assert.equal(readConfig({}).rulesFile, null)
 })
 
-test("readConfig: reminderMode defaults to once; growth honored; invalid → once", () => {
-  assert.equal(readConfig({}).reminderMode, "once", "default is experience-first once")
+test("readConfig: reminderMode defaults to stop; once/growth honored; invalid → stop", () => {
+  assert.equal(readConfig({}).reminderMode, "stop", "default defers review to the Stop block")
+  assert.equal(readConfig({ SDD_REVIEW_REMINDER_MODE: "once" }).reminderMode, "once")
   assert.equal(readConfig({ SDD_REVIEW_REMINDER_MODE: "growth" }).reminderMode, "growth")
-  assert.equal(readConfig({ SDD_REVIEW_REMINDER_MODE: " GROWTH " }).reminderMode, "growth", "trimmed + lowercased")
-  assert.equal(readConfig({ SDD_REVIEW_REMINDER_MODE: "bogus" }).reminderMode, "once", "unknown → safe default")
+  assert.equal(readConfig({ SDD_REVIEW_REMINDER_MODE: " STOP " }).reminderMode, "stop", "trimmed + lowercased")
+  assert.equal(readConfig({ SDD_REVIEW_REMINDER_MODE: "bogus" }).reminderMode, "stop", "unknown → safe default")
+})
+
+test("readConfig: changeNoteCap defaults to 3; honors override; 0 disables", () => {
+  assert.equal(readConfig({}).changeNoteCap, 3, "default keeps 3 recent clues per path")
+  assert.equal(readConfig({ SDD_REVIEW_CHANGE_NOTE_CAP: "5" }).changeNoteCap, 5)
+  assert.equal(readConfig({ SDD_REVIEW_CHANGE_NOTE_CAP: "0" }).changeNoteCap, 0, "0 → feature off")
 })

@@ -9,6 +9,7 @@ const {
   withRecord,
   getRecord,
   trackCodePath,
+  appendChangeNote,
   LEDGER_VERSION,
 } = require("../../src/core/ledger")
 
@@ -56,4 +57,27 @@ test("trackCodePath: first sighting → reviewedHash null; never clobbers existi
   // capture again must NOT reset reviewedHash
   const after = trackCodePath(led, "src/a.ts")
   assert.equal(getRecord(after, "src/a.ts").reviewedHash, "deadbeef")
+})
+
+test("appendChangeNote: creates a tracked record carrying the note (reviewedHash null)", () => {
+  const led = appendChangeNote(emptyLedger(), "src/a.ts", { at: "t", summary: "Edit +1/-0", task: "x" }, 3)
+  const r = getRecord(led, "src/a.ts")
+  assert.equal(r.kind, "code")
+  assert.equal(r.reviewedHash, null)
+  assert.deepEqual(r.changeNotes, [{ at: "t", summary: "Edit +1/-0", task: "x" }])
+})
+
+test("appendChangeNote: appends bounded to the most recent `cap`; never clobbers reviewedHash", () => {
+  let led = withRecord(emptyLedger(), "src/a.ts", { kind: "code", reviewedHash: "dead", verdict: "synced" })
+  for (const i of [1, 2, 3, 4]) led = appendChangeNote(led, "src/a.ts", { at: `t${i}`, summary: `s${i}`, task: "" }, 2)
+  const r = getRecord(led, "src/a.ts")
+  assert.equal(r.reviewedHash, "dead", "capture never resets the reviewed hash")
+  assert.deepEqual(r.changeNotes.map((n) => n.summary), ["s3", "s4"], "keeps only newest 2")
+})
+
+test("appendChangeNote: cap<=0 or falsy note → no-op; input ledger never mutated", () => {
+  const base = emptyLedger()
+  assert.equal(appendChangeNote(base, "src/a.ts", { summary: "s" }, 0), base, "cap 0 → same ref / no-op")
+  assert.equal(appendChangeNote(base, "src/a.ts", null, 3), base, "no note → no-op")
+  assert.deepEqual(base.records, {}, "input ledger untouched")
 })

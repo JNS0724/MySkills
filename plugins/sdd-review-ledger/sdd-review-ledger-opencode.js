@@ -107,8 +107,9 @@ var require_config = __commonJS({
     var DEFAULT_REMINDER_DEDUPE_MS = 2e3;
     var DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
     var DEFAULT_BOOTSTRAP_THRESHOLD = 1;
-    var DEFAULT_REMINDER_MODE = "once";
-    var REMINDER_MODES = /* @__PURE__ */ new Set(["once", "growth"]);
+    var DEFAULT_CHANGE_NOTE_CAP = 3;
+    var DEFAULT_REMINDER_MODE = "stop";
+    var REMINDER_MODES = /* @__PURE__ */ new Set(["stop", "once", "growth"]);
     var DISABLE_VALUES = /* @__PURE__ */ new Set(["0", "false", "off", "disabled", "disable"]);
     var normalizeEnvValue = (value) => String(value == null ? "" : value).trim().toLowerCase();
     var isDisabled = (env = process.env) => {
@@ -138,7 +139,8 @@ var require_config = __commonJS({
       scanAlwaysHash: isTruthyFlag(env.SDD_REVIEW_SCAN_ALWAYS_HASH),
       ignoreGlobs: parseListEnv(env.SDD_REVIEW_IGNORE),
       scanRoots: parseListEnv(env.SDD_REVIEW_SCAN_ROOTS),
-      rulesFile: String(env.SDD_REVIEW_RULES_FILE || "").trim() || null
+      rulesFile: String(env.SDD_REVIEW_RULES_FILE || "").trim() || null,
+      changeNoteCap: parseIntEnv(env.SDD_REVIEW_CHANGE_NOTE_CAP, DEFAULT_CHANGE_NOTE_CAP)
     });
     module.exports = {
       DEFAULT_HASH_LEN,
@@ -148,6 +150,7 @@ var require_config = __commonJS({
       DEFAULT_REMINDER_DEDUPE_MS,
       DEFAULT_MAX_FILE_BYTES,
       DEFAULT_BOOTSTRAP_THRESHOLD,
+      DEFAULT_CHANGE_NOTE_CAP,
       DEFAULT_REMINDER_MODE,
       REMINDER_MODES,
       DISABLE_VALUES,
@@ -246,7 +249,7 @@ var require_throttle = __commonJS({
       const lastSet = new Set(cur.lastRemindedPathSet || []);
       const grew = pathSet.some((p) => !lastSet.has(p));
       const sameTurn = cur.lastRemindedBatch !== null && cur.lastRemindedBatch === cur.batch;
-      const suppressed = mode === "once" ? sameTurn : sameTurn && !grew;
+      const suppressed = mode === "stop" ? true : mode === "once" ? sameTurn : sameTurn && !grew;
       const remind = !!hasNeeds && maxReminders > 0 && (cur.sent || 0) < maxReminders && !suppressed;
       if (!remind) return { remind: false, state: cur };
       return {
@@ -584,6 +587,19 @@ var require_ledger = __commonJS({
         ...meta
       });
     };
+    var appendChangeNote = (ledger, key, note, cap = 3) => {
+      if (!note || cap <= 0) return ledger;
+      const base = getRecord(ledger, key) || {
+        kind: "code",
+        reviewedHash: null,
+        verdict: null,
+        rationale: "",
+        reviewedAt: null,
+        by: null
+      };
+      const prev = Array.isArray(base.changeNotes) ? base.changeNotes : [];
+      return withRecord(ledger, key, { ...base, changeNotes: [...prev, note].slice(-cap) });
+    };
     module.exports = {
       LEDGER_VERSION,
       emptyLedger,
@@ -591,7 +607,8 @@ var require_ledger = __commonJS({
       serializeLedger,
       withRecord,
       getRecord,
-      trackCodePath
+      trackCodePath,
+      appendChangeNote
     };
   }
 });
@@ -650,13 +667,17 @@ var require_compute = __commonJS({
         const h = hashWithCache(repoRoot, relPath, record, scan.hashCache, hashLen);
         if (h === null) continue;
         if (h !== (record ? record.reviewedHash : void 0)) {
-          items.push({
+          const item = {
             path: relPath,
             kind: "code",
             currentHash: h,
             candidates: nonArchived,
             reason: reasonFor(record)
-          });
+          };
+          if (record && Array.isArray(record.changeNotes) && record.changeNotes.length) {
+            item.notes = record.changeNotes;
+          }
+          items.push(item);
         }
       }
       const meta = scan.truncated ? { scanTruncated: true, skipped: scan.skipped } : {};
@@ -710,6 +731,14 @@ var require_prompts = __commonJS({
       }
       return `  - ${p}`;
     };
+    var noteLines = (item) => {
+      const notes = item && Array.isArray(item.notes) ? item.notes : [];
+      return notes.map((n) => {
+        const summary = sanitizePath(n && n.summary || "");
+        const task = sanitizePath(n && n.task || "");
+        return `      \u21B3 \u53D8\u66F4\u7EBF\u7D22: ${summary}${task ? `  [\u4EFB\u52A1: ${task}]` : ""}`;
+      });
+    };
     var buildProjectRulesSegment = (rules) => {
       if (!rules || !rules.text) return [];
       const src = sanitizePath(rules.relPath || "");
@@ -725,7 +754,10 @@ var require_prompts = __commonJS({
       if (!needs || needs.length === 0) return "";
       const items = [...needs].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
       const lines = ["<system-reminder>", HEADER, "", "CHANGED (\u672A\u8BC4\u5BA1\uFF0C\u672C\u6279):"];
-      for (const item of items) lines.push(changedLine(item));
+      for (const item of items) {
+        lines.push(changedLine(item));
+        for (const nl of noteLines(item)) lines.push(nl);
+      }
       const dirs = /* @__PURE__ */ new Set();
       for (const item of items) {
         for (const d of item.candidates || []) {
@@ -774,7 +806,10 @@ var require_prompts = __commonJS({
         HEADER,
         `\u6536\u5C3E\u524D\u68C0\u6D4B\u5230 ${items.length} \u9879 SDD \u53D8\u66F4\u5C1A\u672A\u8BC4\u5BA1\uFF0C\u8BF7\u5148\u5B8C\u6210\u8BC4\u5BA1\u518D\u7ED3\u675F\u672C\u56DE\u5408\uFF1A`
       ];
-      for (const item of items) lines.push(`  - ${sanitizePath(item.path)}`);
+      for (const item of items) {
+        lines.push(`  - ${sanitizePath(item.path)}`);
+        for (const nl of noteLines(item)) lines.push(nl);
+      }
       lines.push("", REVIEW_BLOCK, "", ACTION_LINE);
       return lines.join("\n") + "\n";
     };
@@ -907,6 +942,101 @@ var require_rules_file = __commonJS({
       resolveRulesPath,
       sanitizeRulesLine,
       readProjectRules
+    };
+  }
+});
+
+// src/core/session-context.js
+var require_session_context = __commonJS({
+  "src/core/session-context.js"(exports, module) {
+    "use strict";
+    var fs = __require("fs");
+    var path = __require("path");
+    var PROMPT_SNIPPET_MAX = 200;
+    var lastPromptPath = (stateDir, sessionKey) => path.join(stateDir, `last-prompt-${sessionKey}.json`);
+    var snippetOf = (text) => String(text == null ? "" : text).replace(/\s+/g, " ").trim().slice(0, PROMPT_SNIPPET_MAX);
+    var saveLastPrompt = (stateDir, sessionKey, text) => {
+      try {
+        fs.mkdirSync(stateDir, { recursive: true });
+        fs.writeFileSync(lastPromptPath(stateDir, sessionKey), JSON.stringify({ prompt: snippetOf(text) }));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    var loadLastPrompt = (stateDir, sessionKey) => {
+      try {
+        const data = JSON.parse(fs.readFileSync(lastPromptPath(stateDir, sessionKey), "utf8"));
+        return typeof data.prompt === "string" ? data.prompt : "";
+      } catch {
+        return "";
+      }
+    };
+    module.exports = {
+      PROMPT_SNIPPET_MAX,
+      lastPromptPath,
+      snippetOf,
+      saveLastPrompt,
+      loadLastPrompt
+    };
+  }
+});
+
+// src/core/change-note.js
+var require_change_note = __commonJS({
+  "src/core/change-note.js"(exports, module) {
+    "use strict";
+    var { sanitizePath } = require_paths();
+    var SUMMARY_MAX = 120;
+    var SNIPPET_MAX = 80;
+    var TASK_MAX = 120;
+    var lineCount = (s) => {
+      const str = String(s == null ? "" : s);
+      return str === "" ? 0 : str.split(/\r?\n/).length;
+    };
+    var firstNonEmptyLine = (s) => {
+      for (const line of String(s == null ? "" : s).split(/\r?\n/)) {
+        const t = line.trim();
+        if (t) return t;
+      }
+      return "";
+    };
+    var snippet = (s) => firstNonEmptyLine(s).slice(0, SNIPPET_MAX);
+    var buildChangeSummary = (toolName, toolInput) => {
+      const ti = toolInput && typeof toolInput === "object" ? toolInput : {};
+      let raw;
+      if (Array.isArray(ti.edits)) {
+        let adds = 0;
+        let dels = 0;
+        for (const e of ti.edits) {
+          adds += lineCount(e && e.new_string);
+          dels += lineCount(e && e.old_string);
+        }
+        const snip = ti.edits.length ? snippet(ti.edits[0] && ti.edits[0].new_string) : "";
+        raw = `MultiEdit \xD7${ti.edits.length} +${adds}/-${dels}${snip ? `: \xAB${snip}\xBB` : ""}`;
+      } else if ("content" in ti && !("new_string" in ti)) {
+        const snip = snippet(ti.content);
+        raw = `Write (${lineCount(ti.content)} \u884C)${snip ? `: \xAB${snip}\xBB` : ""}`;
+      } else {
+        const snip = snippet(ti.new_string);
+        raw = `Edit +${lineCount(ti.new_string)}/-${lineCount(ti.old_string)}${snip ? `: \xAB${snip}\xBB` : ""}`;
+      }
+      return sanitizePath(raw).slice(0, SUMMARY_MAX);
+    };
+    var buildChangeNote = ({ toolName, toolInput, task = "", now } = {}) => ({
+      at: now || "",
+      summary: buildChangeSummary(toolName, toolInput),
+      task: sanitizePath(String(task == null ? "" : task)).slice(0, TASK_MAX)
+    });
+    module.exports = {
+      SUMMARY_MAX,
+      SNIPPET_MAX,
+      TASK_MAX,
+      lineCount,
+      firstNonEmptyLine,
+      snippet,
+      buildChangeSummary,
+      buildChangeNote
     };
   }
 });
@@ -1159,8 +1289,12 @@ var require_pipeline = __commonJS({
       parseLedger,
       serializeLedger,
       withRecord,
-      trackCodePath
+      trackCodePath,
+      appendChangeNote
     } = require_ledger();
+    var { resolveSessionKey } = require_session_key();
+    var { loadLastPrompt } = require_session_context();
+    var { buildChangeNote } = require_change_note();
     var { ingestCheckoffs } = require_ingest();
     var { parseTodo, renderTodo } = require_todo();
     var { discoverChangeDirs } = require_change_dirs();
@@ -1252,6 +1386,16 @@ var require_pipeline = __commonJS({
         if (ctx.editedPath && classifyPath(ctx.editedPath) === "code") {
           const key = keyFor(repoRoot, ctx.editedPath);
           ledger = trackCodePath(ledger, key, fileMeta(path.join(repoRoot, key)));
+          if (cfg.changeNoteCap > 0) {
+            const sessionKey = resolveSessionKey(ctx.event || {}, env, repoRoot);
+            const note = buildChangeNote({
+              toolName: ctx.event && ctx.event.tool_name,
+              toolInput: ctx.event && ctx.event.tool_input,
+              task: loadLastPrompt(stateDir, sessionKey),
+              now
+            });
+            ledger = appendChangeNote(ledger, key, note, cfg.changeNoteCap);
+          }
         }
         const needs = computeNeedsReview(repoRoot, ledger, cfg);
         if (needs.meta && needs.meta.scanTruncated) {
@@ -1369,6 +1513,7 @@ var require_on_prompt = __commonJS({
     var { resolveStateDir } = require_state_dir();
     var { resolveSessionKey } = require_session_key();
     var { loadThrottle, saveThrottle, bumpBatch } = require_throttle();
+    var { saveLastPrompt } = require_session_context();
     var { buildCarryOver, buildLeftoverCarryOver } = require_prompts();
     var { selectActiveNeeds, selectReviewLeftover } = require_compute();
     var { run } = require_pipeline();
@@ -1378,6 +1523,7 @@ var require_on_prompt = __commonJS({
       if (cfg.disabled) return { deliver: false, text: "" };
       const stateDir = resolveStateDir(ctx.repoRoot);
       const sessionKey = resolveSessionKey(ctx.event || {}, env, ctx.repoRoot);
+      saveLastPrompt(stateDir, sessionKey, ctx.event && (ctx.event.prompt || ctx.event.promptText) || "");
       const prior = loadThrottle(stateDir, sessionKey);
       const remindedLastTurn = prior.lastRemindedBatch !== null && prior.lastRemindedBatch === prior.batch;
       const next = bumpBatch(prior);
@@ -1618,6 +1764,7 @@ ${text}` : text;
           if (!isUserChatMessage(input, output)) return;
           const c = baseCtx(ctx, input);
           c.event.hook_event_name = "UserPromptSubmit";
+          c.event.prompt = contentText(output?.parts || output?.message?.content || input?.parts || input?.message?.content);
           try {
             const res = onPrompt(c);
             if (res?.deliver) {

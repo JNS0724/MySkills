@@ -50,6 +50,26 @@ const trackCodePath = (ledger, key, meta = {}) => {
   })
 }
 
+// appendChangeNote: attach a change-note clue to a code record WITHOUT clobbering its
+// reviewedHash/verdict (capture-side, like trackCodePath). Keeps only the most recent
+// `cap` notes. A checkoff (ingestCheckoffs rebuilds the whole record via withRecord and
+// drops changeNotes) naturally clears them, so changeNotes always means "changes since
+// last review". cap<=0 or a falsy note → no-op (feature disabled). Immutable.
+const appendChangeNote = (ledger, key, note, cap = 3) => {
+  if (!note || cap <= 0) return ledger
+  const base =
+    getRecord(ledger, key) || {
+      kind: "code",
+      reviewedHash: null,
+      verdict: null,
+      rationale: "",
+      reviewedAt: null,
+      by: null,
+    }
+  const prev = Array.isArray(base.changeNotes) ? base.changeNotes : []
+  return withRecord(ledger, key, { ...base, changeNotes: [...prev, note].slice(-cap) })
+}
+
 module.exports = {
   LEDGER_VERSION,
   emptyLedger,
@@ -58,4 +78,5 @@ module.exports = {
   withRecord,
   getRecord,
   trackCodePath,
+  appendChangeNote,
 }

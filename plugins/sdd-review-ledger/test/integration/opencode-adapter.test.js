@@ -9,6 +9,12 @@ const native = require("../../src/adapters/opencode/native-plugin")
 const { run } = require("../../src/pipeline")
 const { todoPathFor } = require("../../src/core/state-dir")
 
+// The product default is now reminderMode "stop" (review deferred to the Stop sweep).
+// These adapter tests verify the active-reminder INJECTION wiring, which needs a mode
+// that fires; force once. node --test runs each file in its own process, so this does
+// not leak into other suites.
+process.env.SDD_REVIEW_REMINDER_MODE = "once"
+
 const mkRepo = () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sdd-opencode-")))
   fs.mkdirSync(path.join(root, "sdd", "changes", "greeting"), { recursive: true })
