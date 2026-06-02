@@ -1149,7 +1149,8 @@ var require_todo = __commonJS({
         return a[0] < b[0] ? -1 : 1;
       }).slice(0, reviewedLimit);
       for (const [p, r] of reviewed) {
-        const mark = isThinRationale(r.rationale) ? ` ${THIN_MARK}` : "";
+        const isAutoBaseline = r.verdict === "bootstrap" || r.by === "bootstrap";
+        const mark = !isAutoBaseline && isThinRationale(r.rationale) ? ` ${THIN_MARK}` : "";
         const rationale = r.rationale ? ` \u2014 ${r.rationale}` : " \u2014";
         lines.push(`- [x] ${sanitizePath(p)}@${r.reviewedHash}${rationale}${mark}`);
       }

@@ -98,6 +98,21 @@ test("renderTodo: thin mark is display-only, does not change checkbox state", ()
   assert.ok(line.startsWith("- [x] "), "still checked/cleared despite thin mark")
 })
 
+test("renderTodo: bootstrap auto-baseline is NOT marked '理由过简' (only human checkoffs are)", () => {
+  let led = withRecord(emptyLedger(), "src/boot.ts", {
+    kind: "code",
+    reviewedHash: "0d",
+    verdict: "bootstrap",
+    rationale: "",
+    reviewedAt: "2026-06-02T00:00:00Z",
+    by: "bootstrap",
+  })
+  const out = renderTodo([], led)
+  const line = out.split("\n").find((l) => l.includes("src/boot.ts"))
+  assert.ok(line.startsWith("- [x] "), "bootstrap baseline still shows in the audit history")
+  assert.ok(!line.includes(THIN_MARK), "auto-baseline (empty rationale) must NOT be nagged to supplement a reason")
+})
+
 test("renderTodo: scan-budget truncation surfaces a non-silent header warning (R1 §4.4)", () => {
   const needs = [{ path: "src/a.ts", currentHash: "aaaa", candidates: ["greeting"] }]
   const led = emptyLedger()

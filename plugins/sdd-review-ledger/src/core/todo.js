@@ -86,7 +86,12 @@ const renderTodo = (needs, ledger, opts = {}) => {
     })
     .slice(0, reviewedLimit)
   for (const [p, r] of reviewed) {
-    const mark = isThinRationale(r.rationale) ? ` ${THIN_MARK}` : ""
+    // THIN_MARK nudges HUMAN checkoffs toward a better rationale; it must NOT apply to
+    // the auto-baseline (verdict/by "bootstrap"), whose empty rationale is expected —
+    // the user never reviewed those files, so "理由过简，建议补充" is wrong/noisy there
+    // (otherwise a cold-start bootstrap floods the audit history with the nag).
+    const isAutoBaseline = r.verdict === "bootstrap" || r.by === "bootstrap"
+    const mark = !isAutoBaseline && isThinRationale(r.rationale) ? ` ${THIN_MARK}` : ""
     const rationale = r.rationale ? ` — ${r.rationale}` : " —"
     lines.push(`- [x] ${sanitizePath(p)}@${r.reviewedHash}${rationale}${mark}`)
   }
