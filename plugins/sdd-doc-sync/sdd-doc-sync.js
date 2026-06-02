@@ -22,6 +22,11 @@ const STATE_FILE = ".sdd-doc-sync-state.json"
 const HEADER = "# SDD 文档同步评审（自动维护：代码改动后在此登记；勾选 [x] = 已评审/已同步）"
 const SANITIZE_MAX = 300
 const LAST_PROMPT_MAX = 120
+// 可选规则文件（小 trick）：动态往 Stop 评审提示词里追加"项目附加评审要求"。优先用
+// SDD_DOC_SYNC_RULES_FILE 指定的路径，否则取仓库根的 .sdd-doc-sync-rules.md。改文件即生效。
+const RULES_FILE = ".sdd-doc-sync-rules.md"
+const RULES_ENV = "SDD_DOC_SYNC_RULES_FILE"
+const RULES_MAX_BYTES = 4096
 // `- [ ] path` 或 `- [x] path — 理由`。path 不含空白；理由可选。
 const TODO_LINE = /^- \[([ x])\] (\S+)(?: — (.*))?$/
 // SDD change-dir 约定（与 sdd-review-ledger 一致）。
@@ -53,6 +58,38 @@ const sanitize = (s) => {
     out += isCtrl || isBidi ? " " : ch
   }
   return out.trim().slice(0, SANITIZE_MAX)
+}
+
+// sanitizeLine：与 sanitize 一样剥离控制符/bidi，但用于规则文件的"每一行"——保留行内文本与
+// 左侧缩进，只去掉行尾空白并限长（不把多行塌成一行）。
+const sanitizeLine = (s) => {
+  const input = String(s == null ? "" : s)
+  let out = ""
+  for (const ch of input) {
+    const code = ch.codePointAt(0)
+    const isCtrl = code <= 0x1f || code === 0x7f
+    const isBidi =
+      (code >= 0x200e && code <= 0x200f) ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069)
+    out += isCtrl || isBidi ? " " : ch
+  }
+  return out.replace(/\s+$/u, "").slice(0, SANITIZE_MAX)
+}
+
+// byteSlice：按 UTF-8 字节预算在码点边界处截断（中文按字节算，避免截碎多字节）。
+const byteSlice = (s, maxBytes) => {
+  const str = String(s == null ? "" : s)
+  if (Buffer.byteLength(str, "utf8") <= maxBytes) return str
+  let bytes = 0
+  let out = ""
+  for (const ch of str) {
+    const b = Buffer.byteLength(ch, "utf8")
+    if (bytes + b > maxBytes) break
+    bytes += b
+    out += ch
+  }
+  return out
 }
 
 // isCodePath：repo 相对（或任意）路径是否算"代码文件"。.md / sdd 文档目录排除。
@@ -116,9 +153,23 @@ const upsertPending = (text, rawPath, rawReason) => {
   return joinTodo(ensureHeader([...lines, newLine]))
 }
 
+// buildRulesSegment：把可选规则文件的内容渲染成"项目附加评审要求"段（纯函数）。无规则 → []，
+// 此时 buildStopPrompt 输出与未启用时逐字节一致（byte-stable）。
+const buildRulesSegment = (rules) => {
+  if (!rules || !Array.isArray(rules.lines) || rules.lines.length === 0) return []
+  const seg = [
+    "",
+    `本项目附加评审要求（来自 ${rules.relPath}，务必逐条一并满足；是否偏差仍由你判断）:`,
+    ...rules.lines.map((l) => `  ${l}`),
+  ]
+  if (rules.truncated) seg.push(`  （规则文件超长，已截断；完整内容见 ${rules.relPath}）`)
+  return seg
+}
+
 // buildStopPrompt：强硬的结构化评审提示词（Stop block 的 reason）。让模型先取证、再下结论，
-// 代码领先文档就直接改 design/tasks 同步。
-const buildStopPrompt = (items) => {
+// 代码领先文档就直接改 design/tasks 同步。rules 可选：把项目附加评审要求插在待评审清单之后、
+// 通用评审纪律之前（靠前更易被遵循）。
+const buildStopPrompt = (items, rules) => {
   const list = items.map((it) => {
     const reason = sanitize(it.reason)
     return `  - ${sanitize(it.path)}${reason ? ` — ${reason}` : ""}`
@@ -128,6 +179,7 @@ const buildStopPrompt = (items) => {
     `收尾前检测到 ${items.length} 个代码文件已改动、文档可能落后，请在结束本回合前逐项评审：`,
     "待评审：",
     ...list,
+    ...buildRulesSegment(rules),
     "",
     "评审纪律（你是唯一裁判；下结论前必须先取证，不接受裸判断）。对每个待评审文件，按此结构输出，最后才下结论：",
     "  1. 读取该代码文件，引用其当前关键实现（具体函数/行为）",
@@ -263,9 +315,42 @@ const saveLastPrompt = (repoRoot, prompt) => {
   writeFileAtomic(statePathFor(repoRoot), JSON.stringify({ lastPrompt: sanitize(prompt).slice(0, LAST_PROMPT_MAX) }))
 }
 
+// rulesPathFor：规则文件绝对路径。env 覆盖优先（相对路径按 repoRoot 解析），否则用约定的默认名。
+const rulesPathFor = (repoRoot, env = process.env) => {
+  const override = String((env && env[RULES_ENV]) || "").trim()
+  if (override) return path.isAbsolute(override) ? override : path.join(repoRoot, override)
+  return path.join(repoRoot, RULES_FILE)
+}
+
+// loadRules：读规则文件 → { relPath, lines, truncated } | null（fail-open）。空/缺失/读不出 → null。
+// 按字节上限码点安全截断，逐行消毒，去掉尾随空行。
+const loadRules = (repoRoot, env = process.env) => {
+  const abs = rulesPathFor(repoRoot, env)
+  let raw
+  try {
+    raw = fs.readFileSync(abs, "utf8")
+  } catch {
+    return null
+  }
+  if (!raw || !raw.trim()) return null
+  const truncated = Buffer.byteLength(raw, "utf8") > RULES_MAX_BYTES
+  const body = truncated ? byteSlice(raw, RULES_MAX_BYTES) : raw
+  const lines = body.split(/\r?\n/).map(sanitizeLine)
+  while (lines.length && lines[lines.length - 1] === "") lines.pop()
+  if (lines.length === 0) return null
+  let relPath
+  try {
+    relPath = toPosix(path.relative(repoRoot, abs))
+  } catch {
+    relPath = RULES_FILE
+  }
+  if (!relPath || relPath.startsWith("..")) relPath = toPosix(abs)
+  return { relPath: sanitize(relPath), lines, truncated }
+}
+
 // ── 事件处理（纯：给定 event + repoRoot → hook 输出对象或 null） ──────────────────
 
-const handleEvent = (event, repoRoot) => {
+const handleEvent = (event, repoRoot, env = process.env) => {
   const hook = (event && (event.hook_event_name || event.hookEventName)) || ""
   if (!isSddProject(repoRoot)) return null // 非 SDD 项目 → 全程静默
 
@@ -294,7 +379,7 @@ const handleEvent = (event, repoRoot) => {
     if (event && (event.stop_hook_active || event.stopHookActive)) return null // 至多打断一次
     const items = pendingItems(readFileSafe(todoPathFor(repoRoot)))
     if (items.length === 0) return null
-    return { decision: "block", reason: buildStopPrompt(items) }
+    return { decision: "block", reason: buildStopPrompt(items, loadRules(repoRoot, env)) }
   }
 
   return null
@@ -345,7 +430,7 @@ const main = async () => {
   let out = null
   try {
     const cwd = (event && event.cwd) || process.env.CLAUDE_PROJECT_DIR || process.cwd()
-    out = handleEvent(event, findRepoRoot(cwd))
+    out = handleEvent(event, findRepoRoot(cwd), process.env)
   } catch {
     out = null // fail-open
   }
@@ -356,14 +441,19 @@ const main = async () => {
 module.exports = {
   TODO_FILE,
   STATE_FILE,
+  RULES_FILE,
+  RULES_ENV,
   HEADER,
   TODO_LINE,
   toPosix,
   sanitize,
+  sanitizeLine,
+  byteSlice,
   isCodePath,
   parseTodo,
   pendingItems,
   upsertPending,
+  buildRulesSegment,
   buildStopPrompt,
   editedPathFromEvent,
   findRepoRoot,
@@ -371,6 +461,8 @@ module.exports = {
   isSddProject,
   todoPathFor,
   statePathFor,
+  rulesPathFor,
+  loadRules,
   loadLastPrompt,
   saveLastPrompt,
   writeFileAtomic,

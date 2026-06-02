@@ -12,12 +12,15 @@ const {
   parseTodo,
   pendingItems,
   upsertPending,
+  buildRulesSegment,
   buildStopPrompt,
   editedPathFromEvent,
   discoverChangeDirs,
   isSddProject,
   todoPathFor,
   statePathFor,
+  rulesPathFor,
+  loadRules,
   handleEvent,
 } = require("../sdd-doc-sync")
 
@@ -192,4 +195,67 @@ test("UserPromptSubmit：写 lastPrompt，并作为后续登记的理由标签",
   handleEvent(postEdit("src/login.ts"), root)
   const todo = fs.readFileSync(todoPathFor(root), "utf8")
   assert.ok(todo.includes("- [ ] src/login.ts — Edit · 修复登录流程"))
+})
+
+// ── 规则文件（动态追加评审要求） ──────────────────────────────────────────────
+
+test("无规则 → buildStopPrompt 与不传参逐字节一致（byte-stable）", () => {
+  const items = [{ path: "src/a.ts", reason: "Edit" }]
+  assert.strictEqual(buildStopPrompt(items), buildStopPrompt(items, null))
+  assert.strictEqual(buildStopPrompt(items), buildStopPrompt(items, { lines: [] }))
+})
+
+test("buildRulesSegment：无规则 → []；有规则 → 含标题 + 缩进行 + 截断标记", () => {
+  assert.deepStrictEqual(buildRulesSegment(null), [])
+  assert.deepStrictEqual(buildRulesSegment({ relPath: "x", lines: [] }), [])
+  const seg = buildRulesSegment({ relPath: ".sdd-doc-sync-rules.md", lines: ["必须更新 CHANGELOG", "公共 API 改动要标 @since"], truncated: true })
+  const joined = seg.join("\n")
+  assert.ok(joined.includes("本项目附加评审要求（来自 .sdd-doc-sync-rules.md"))
+  assert.ok(joined.includes("  必须更新 CHANGELOG"))
+  assert.ok(joined.includes("已截断"))
+})
+
+test("loadRules：默认约定文件 / env 覆盖 / 缺失 / 超长截断", () => {
+  const root = mkSddRepo()
+  assert.strictEqual(loadRules(root, {}), null) // 无文件 → null
+
+  // 默认约定文件
+  fs.writeFileSync(path.join(root, ".sdd-doc-sync-rules.md"), "- 必须更新 CHANGELOG\n- 标注 @since\n")
+  const r = loadRules(root, {})
+  assert.deepStrictEqual(r.lines, ["- 必须更新 CHANGELOG", "- 标注 @since"])
+  assert.strictEqual(r.truncated, false)
+  assert.strictEqual(r.relPath, ".sdd-doc-sync-rules.md")
+
+  // env 覆盖（相对路径按 repoRoot 解析）
+  fs.writeFileSync(path.join(root, "custom.md"), "- 覆盖规则\n")
+  const r2 = loadRules(root, { SDD_DOC_SYNC_RULES_FILE: "custom.md" })
+  assert.deepStrictEqual(r2.lines, ["- 覆盖规则"])
+
+  // 超长 → 截断标记
+  fs.writeFileSync(path.join(root, ".sdd-doc-sync-rules.md"), "x".repeat(5000))
+  assert.strictEqual(loadRules(root, {}).truncated, true)
+})
+
+test("rulesPathFor：env 优先、绝对路径直用、否则约定默认名", () => {
+  assert.ok(rulesPathFor("/repo", {}).endsWith(".sdd-doc-sync-rules.md"))
+  assert.strictEqual(rulesPathFor("/repo", { SDD_DOC_SYNC_RULES_FILE: "/abs/rules.md" }), "/abs/rules.md")
+})
+
+test("Stop 集成：有规则文件 → 评审提示词追加项目附加评审要求", () => {
+  const root = mkSddRepo()
+  fs.writeFileSync(path.join(root, ".sdd-doc-sync-rules.md"), "- 必须更新 CHANGELOG\n")
+  handleEvent(postEdit("src/foo.ts"), root)
+  const res = handleEvent({ hook_event_name: "Stop" }, root)
+  assert.ok(res && res.decision === "block")
+  assert.ok(res.reason.includes("本项目附加评审要求"))
+  assert.ok(res.reason.includes("必须更新 CHANGELOG"))
+})
+
+test("Stop 集成：env 覆盖规则文件路径", () => {
+  const root = mkSddRepo()
+  const abs = path.join(root, "team-rules.md")
+  fs.writeFileSync(abs, "- 团队规则：先更新 design\n")
+  handleEvent(postEdit("src/foo.ts"), root)
+  const res = handleEvent({ hook_event_name: "Stop" }, root, { SDD_DOC_SYNC_RULES_FILE: abs })
+  assert.ok(res.reason.includes("团队规则：先更新 design"))
 })
