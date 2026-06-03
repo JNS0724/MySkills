@@ -18,7 +18,7 @@
 
 - ❌ 不注入 git diff（让模型自己读文件）
 - ❌ 不做内容哈希 / ledger（清除靠你/模型勾选复选框，不靠哈希）
-- ❌ 无第三方依赖、无构建步骤、无 OpenCode 适配——就一个 `.js`
+- ❌ 无第三方依赖、无构建步骤；Claude Code / OpenCode 各一个入口，核心逻辑复用同一个 `sdd-doc-sync.js`
 
 需要哈希追踪、跨版本防误清、change-note 线索、多平台等更强能力，见隔壁 [`sdd-review-ledger`](../sdd-review-ledger)。本插件是验证"用户是否关注这个场景"的最小试水。
 
@@ -51,6 +51,27 @@
 
 只在**含 `sdd/changes/<change>/`（或 `.sdd/changes/`）且有 `design.md`/`tasks.md`/`proposal.md` 的项目**里生效；其它项目全程静默。
 
+## 安装（OpenCode）
+
+OpenCode 入口是 `sdd-doc-sync-opencode.js`，它会复用 `sdd-doc-sync.js` 里的核心逻辑。
+
+项目级安装示例：
+
+```powershell
+New-Item -ItemType Directory -Force .opencode\plugins
+Copy-Item E:\coding\sdd\SDD-plugins\plugins\sdd-doc-sync\sdd-doc-sync-opencode.js .opencode\plugins\sdd-doc-sync-opencode.js -Force
+$env:SDD_DOC_SYNC_CORE = "E:\coding\sdd\SDD-plugins\plugins\sdd-doc-sync\sdd-doc-sync.js"
+opencode
+```
+
+`SDD_DOC_SYNC_CORE` 用来指向原来的 Claude/core 文件，这样 `.opencode/plugins/` 里只需要放 OpenCode 入口文件。源码目录内开发或测试时，如果两个文件同目录，也可以不设这个变量，入口会默认 `require("./sdd-doc-sync")`。
+
+OpenCode 映射关系：
+
+- `chat.message`：记录本轮用户提示词，后续登记项会带上这个任务标签。
+- `tool.execute.after`：捕获 `edit` / `write` / `multiedit` / `patch` / `apply_patch`，登记受改代码文件。
+- `session.idle` / `session.status: idle`：发现 `.sdd-doc-sync.md` 仍有 `[ ]` 时，通过 `session.promptAsync` 自动向同一会话发送收尾评审提示，不依赖用户再手动触发下一轮。
+
 ## 生成的文件（建议加进 `.gitignore`）
 
 - `.sdd-doc-sync.md` — 待评审/已评审清单（人可读、模型可编辑）。`- [ ]` = 待评审，`- [x] … — 理由` = 已评审记录。
@@ -64,6 +85,8 @@
 ## 动态增加评审要求（小 trick，可选）
 
 在仓库根放一个 **`.sdd-doc-sync-rules.md`**，里面写本项目的额外评审要求（一行一条），它会被**原样注入**到 Stop 评审提示词的「本项目附加评审要求」段——插在待评审清单之后、通用评审纪律之前（靠前更易被遵循）。**改文件即生效**，下次 Stop 就用新内容，无需重启。
+
+可以先复制本插件附带的极简示例：`plugins/sdd-doc-sync/.sdd-doc-sync-rules.example.md` → 仓库根 `.sdd-doc-sync-rules.md`，再按项目约定微调。
 
 ```markdown
 - 公共 API 改动必须更新 design.md 的接口表

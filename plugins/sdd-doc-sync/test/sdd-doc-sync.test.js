@@ -5,6 +5,7 @@ const assert = require("node:assert")
 const fs = require("fs")
 const os = require("os")
 const path = require("path")
+const { pathToFileURL } = require("node:url")
 
 const {
   sanitize,
@@ -24,6 +25,15 @@ const {
   handleEvent,
 } = require("../sdd-doc-sync")
 
+let SddDocSyncOpenCode
+let opencodePrivate
+
+test.before(async () => {
+  const mod = await import(pathToFileURL(path.join(__dirname, "..", "sdd-doc-sync-opencode.js")).href)
+  SddDocSyncOpenCode = mod.SddDocSyncOpenCode
+  opencodePrivate = mod._private
+})
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // 造一个临时 SDD 仓：sdd/changes/x/design.md 让 isSddProject 为真。
@@ -41,6 +51,20 @@ const postEdit = (filePath, tool = "Edit") => ({
   tool_name: tool,
   tool_input: { file_path: filePath },
 })
+
+const makeOpenCodeHooks = (root, prompts = [], logs = []) =>
+  SddDocSyncOpenCode({
+    directory: root,
+    worktree: root,
+    client: {
+      app: {
+        log: async (entry) => logs.push(entry),
+      },
+      session: {
+        prompt: async (payload) => prompts.push(payload),
+      },
+    },
+  })
 
 // ── 纯函数 ────────────────────────────────────────────────────────────────────
 
@@ -236,6 +260,25 @@ test("loadRules：默认约定文件 / env 覆盖 / 缺失 / 超长截断", () =
   assert.strictEqual(loadRules(root, {}).truncated, true)
 })
 
+test("示例规则文件可复制为仓库默认规则", () => {
+  const root = mkSddRepo()
+  try {
+    fs.copyFileSync(
+      path.join(__dirname, "..", ".sdd-doc-sync-rules.example.md"),
+      path.join(root, ".sdd-doc-sync-rules.md"),
+    )
+    const r = loadRules(root, {})
+    assert.strictEqual(r.relPath, ".sdd-doc-sync-rules.md")
+    assert.deepStrictEqual(r.lines, [
+      "- 公共 API 或导出函数签名变化时，必须同步 design.md。",
+      "- 新增用户可见行为或业务规则时，必须同步 tasks.md。",
+      "- 纯重构无需改文档，但要在 .sdd-doc-sync.md 写清“行为不变”的依据。",
+    ])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("rulesPathFor：env 优先、绝对路径直用、否则约定默认名", () => {
   assert.ok(rulesPathFor("/repo", {}).endsWith(".sdd-doc-sync-rules.md"))
   assert.strictEqual(rulesPathFor("/repo", { SDD_DOC_SYNC_RULES_FILE: "/abs/rules.md" }), "/abs/rules.md")
@@ -258,4 +301,162 @@ test("Stop 集成：env 覆盖规则文件路径", () => {
   handleEvent(postEdit("src/foo.ts"), root)
   const res = handleEvent({ hook_event_name: "Stop" }, root, { SDD_DOC_SYNC_RULES_FILE: abs })
   assert.ok(res.reason.includes("团队规则：先更新 design"))
+})
+
+// OpenCode native plugin adapter
+
+test("OpenCode chat.message + edit tool registers a code file with the user prompt tag", async () => {
+  assert.strictEqual(typeof opencodePrivate, "function")
+  const root = mkSddRepo()
+  try {
+    const hooks = await makeOpenCodeHooks(root)
+
+    await hooks["chat.message"](
+      { sessionID: "session-A", message: { role: "user", content: "fix login flow" } },
+      { message: { role: "user" }, parts: [{ type: "text", text: "fix login flow" }] }
+    )
+    assert.strictEqual(JSON.parse(fs.readFileSync(statePathFor(root), "utf8")).lastPrompt, "fix login flow")
+
+    await hooks["tool.execute.before"](
+      { tool: "edit", sessionID: "session-A", callID: "call-A" },
+      { args: { filePath: "src/login.ts" } }
+    )
+    await hooks["tool.execute.after"](
+      { tool: "edit", sessionID: "session-A", callID: "call-A" },
+      { title: "edited", output: "updated login" }
+    )
+
+    const todo = fs.readFileSync(todoPathFor(root), "utf8")
+    assert.ok(todo.includes("- [ ] src/login.ts"))
+    assert.ok(todo.includes("Edit · fix login flow"))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("OpenCode adapter extracts apply_patch paths and records them as edits", async () => {
+  const root = mkSddRepo()
+  const patchText = [
+    "*** Begin Patch",
+    "*** Update File: src/patched.ts",
+    "@@",
+    "-old",
+    "+new",
+    "*** End Patch",
+  ].join("\n")
+
+  try {
+    assert.strictEqual(opencodePrivate.patchFilePath(patchText), "src/patched.ts")
+    const hooks = await makeOpenCodeHooks(root)
+
+    await hooks["tool.execute.after"](
+      { tool: "apply_patch", sessionID: "session-patch", callID: "call-patch", args: { patch: patchText } },
+      { title: "patched", output: "patched src/patched.ts" }
+    )
+
+    assert.ok(fs.readFileSync(todoPathFor(root), "utf8").includes("- [ ] src/patched.ts"))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("OpenCode idle event sends the Stop review prompt as an automatic session message", async () => {
+  const root = mkSddRepo()
+  const prompts = []
+  try {
+    handleEvent(postEdit("src/foo.ts"), root)
+    const hooks = await makeOpenCodeHooks(root, prompts)
+    await hooks["chat.message"](
+      {
+        sessionID: "session-idle",
+        agent: "docsync",
+        model: { providerID: "deepseek", modelID: "deepseek-chat" },
+        message: { role: "user", content: "implement checkout badge" },
+      },
+      { message: { role: "user" }, parts: [{ type: "text", text: "implement checkout badge" }] }
+    )
+
+    await hooks.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "session-idle", status: { type: "idle" } },
+      },
+    })
+    assert.strictEqual(prompts.length, 1)
+    assert.deepStrictEqual(prompts[0].path, { id: "session-idle" })
+    assert.deepStrictEqual(prompts[0].query, { directory: path.resolve(root) })
+    assert.deepStrictEqual(prompts[0].body.model, { providerID: "deepseek", modelID: "deepseek-chat" })
+    assert.strictEqual(prompts[0].body.agent, "docsync")
+    assert.strictEqual(prompts[0].body.parts[0].type, "text")
+    assert.strictEqual(prompts[0].body.parts[0].synthetic, true)
+    assert.strictEqual(prompts[0].body.parts[0].metadata.source, "sdd-doc-sync-opencode")
+    assert.ok(prompts[0].body.parts[0].text.includes("[SDD-DOC-SYNC"))
+    assert.ok(prompts[0].body.parts[0].text.includes("src/foo.ts"))
+
+    await hooks.event({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "session-idle" },
+      },
+    })
+    assert.strictEqual(prompts.length, 1)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("OpenCode promptSessionCompat falls back to the v2 flat SDK payload shape", async () => {
+  const root = mkSddRepo()
+  const calls = []
+  try {
+    const sent = await opencodePrivate.promptSessionCompat(
+      {
+        directory: root,
+        worktree: root,
+        client: {
+          session: {
+            promptAsync: async (payload) => {
+              calls.push(payload)
+              if (calls.length === 1) throw new Error("v1 shape unavailable")
+            },
+          },
+        },
+      },
+      "session-v2",
+      "review pending docs",
+      { agent: "docsync", model: { providerID: "minimax", modelID: "minimax-text" } }
+    )
+    assert.strictEqual(sent, true)
+    assert.strictEqual(calls.length, 2)
+    assert.deepStrictEqual(calls[1], {
+      sessionID: "session-v2",
+      directory: path.resolve(root),
+      agent: "docsync",
+      model: { providerID: "minimax", modelID: "minimax-text" },
+      parts: [
+        {
+          type: "text",
+          text: "review pending docs",
+          synthetic: true,
+          metadata: { source: "sdd-doc-sync-opencode" },
+        },
+      ],
+    })
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("OpenCode adapter stays silent outside SDD projects", async () => {
+  const root = mkPlainRepo()
+  try {
+    const hooks = await makeOpenCodeHooks(root)
+    await hooks["tool.execute.after"](
+      { tool: "write", sessionID: "session-plain", callID: "call-plain", args: { filePath: "src/plain.ts" } },
+      { title: "written", output: "created src/plain.ts" }
+    )
+    assert.strictEqual(fs.existsSync(todoPathFor(root)), false)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
