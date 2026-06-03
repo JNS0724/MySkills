@@ -13,12 +13,15 @@ const {
   parseTodo,
   pendingItems,
   upsertPending,
-  buildRulesSegment,
+  DEFAULT_STOP_PROMPT_TEMPLATE,
   buildStopPrompt,
+  renderPromptTemplate,
   editedPathFromEvent,
   discoverChangeDirs,
+  generatedDirFor,
   isSddProject,
   todoPathFor,
+  todoRefFor,
   statePathFor,
   rulesPathFor,
   loadRules,
@@ -39,6 +42,7 @@ test.before(async () => {
 // 造一个临时 SDD 仓：sdd/changes/x/design.md 让 isSddProject 为真。
 const mkSddRepo = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sdd-doc-sync-"))
+  fs.mkdirSync(path.join(root, ".git"), { recursive: true })
   fs.mkdirSync(path.join(root, "sdd", "changes", "x"), { recursive: true })
   fs.writeFileSync(path.join(root, "sdd", "changes", "x", "design.md"), "# X\n按时段返回问候\n")
   return root
@@ -52,7 +56,7 @@ const postEdit = (filePath, tool = "Edit") => ({
   tool_input: { file_path: filePath },
 })
 
-const makeOpenCodeHooks = (root, prompts = [], logs = []) =>
+const makeOpenCodeHooks = (root, prompts = [], logs = [], toasts = []) =>
   SddDocSyncOpenCode({
     directory: root,
     worktree: root,
@@ -60,11 +64,19 @@ const makeOpenCodeHooks = (root, prompts = [], logs = []) =>
       app: {
         log: async (entry) => logs.push(entry),
       },
+      tui: {
+        showToast: async (entry) => toasts.push(entry),
+      },
       session: {
         prompt: async (payload) => prompts.push(payload),
       },
     },
   })
+
+const readJsonl = (file) =>
+  fs.existsSync(file)
+    ? fs.readFileSync(file, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+    : []
 
 // ── 纯函数 ────────────────────────────────────────────────────────────────────
 
@@ -168,6 +180,18 @@ test("discoverChangeDirs / isSddProject", () => {
   assert.strictEqual(isSddProject(plain), false)
 })
 
+test("generated files live under .git/sdd-doc-sync in git repositories", () => {
+  const root = mkSddRepo()
+  try {
+    assert.strictEqual(generatedDirFor(root), path.join(root, ".git", "sdd-doc-sync"))
+    assert.strictEqual(todoPathFor(root), path.join(root, ".git", "sdd-doc-sync", ".sdd-doc-sync.md"))
+    assert.strictEqual(statePathFor(root), path.join(root, ".git", "sdd-doc-sync", ".sdd-doc-sync-state.json"))
+    assert.strictEqual(todoRefFor(root), ".git/sdd-doc-sync/.sdd-doc-sync.md")
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 // ── handleEvent 集成 ──────────────────────────────────────────────────────────
 
 test("非 SDD 项目：全程静默、不建文件", () => {
@@ -183,11 +207,28 @@ test("PostToolUse 代码改动 → 登记 [ ] 行；文档改动不登记", () =
   assert.strictEqual(handleEvent(postEdit("src/foo.ts"), root), null) // 静默
   const todo = fs.readFileSync(todoPathFor(root), "utf8")
   assert.ok(todo.includes("- [ ] src/foo.ts"))
+  assert.strictEqual(fs.existsSync(path.join(root, ".sdd-doc-sync.md")), false)
 
   // .md 文档不登记
   handleEvent(postEdit("sdd/changes/x/design.md"), root)
   const todo2 = fs.readFileSync(todoPathFor(root), "utf8")
   assert.ok(!todo2.includes("design.md"))
+})
+
+test("legacy root todo is read when upgrading to internal generated files", () => {
+  const root = mkSddRepo()
+  try {
+    fs.writeFileSync(path.join(root, ".sdd-doc-sync.md"), "# old\n\n- [ ] src/old.ts — legacy\n")
+    handleEvent(postEdit("src/new.ts"), root)
+    const todo = fs.readFileSync(todoPathFor(root), "utf8")
+    assert.ok(todo.includes("- [ ] src/old.ts"))
+    assert.ok(todo.includes("- [ ] src/new.ts"))
+    const res = handleEvent({ hook_event_name: "Stop" }, root)
+    assert.ok(res.reason.includes("src/old.ts"))
+    assert.ok(res.reason.includes("src/new.ts"))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test("Stop：有待评审 → block 且 reason 含路径；stop_hook_active → 不 block", () => {
@@ -197,6 +238,7 @@ test("Stop：有待评审 → block 且 reason 含路径；stop_hook_active → 
   const res = handleEvent({ hook_event_name: "Stop" }, root)
   assert.ok(res && res.decision === "block")
   assert.ok(res.reason.includes("src/foo.ts"))
+  assert.ok(res.reason.includes(".git/sdd-doc-sync/.sdd-doc-sync.md"))
 
   // 已经打断过一次 → 放行（NO-WEDGE-LOOP）
   assert.strictEqual(handleEvent({ hook_event_name: "Stop", stop_hook_active: true }, root), null)
@@ -221,46 +263,51 @@ test("UserPromptSubmit：写 lastPrompt，并作为后续登记的理由标签",
   assert.ok(todo.includes("- [ ] src/login.ts — Edit · 修复登录流程"))
 })
 
-// ── 规则文件（动态追加评审要求） ──────────────────────────────────────────────
+// ── Stop prompt 模板文件 ─────────────────────────────────────────────────────
 
-test("无规则 → buildStopPrompt 与不传参逐字节一致（byte-stable）", () => {
+test("无模板 → buildStopPrompt 使用当前内置默认模板", () => {
   const items = [{ path: "src/a.ts", reason: "Edit" }]
   assert.strictEqual(buildStopPrompt(items), buildStopPrompt(items, null))
-  assert.strictEqual(buildStopPrompt(items), buildStopPrompt(items, { lines: [] }))
+  assert.strictEqual(buildStopPrompt(items), renderPromptTemplate(DEFAULT_STOP_PROMPT_TEMPLATE, items, ".sdd-doc-sync.md"))
 })
 
-test("buildRulesSegment：无规则 → []；有规则 → 含标题 + 缩进行 + 截断标记", () => {
-  assert.deepStrictEqual(buildRulesSegment(null), [])
-  assert.deepStrictEqual(buildRulesSegment({ relPath: "x", lines: [] }), [])
-  const seg = buildRulesSegment({ relPath: ".sdd-doc-sync-rules.md", lines: ["必须更新 CHANGELOG", "公共 API 改动要标 @since"], truncated: true })
-  const joined = seg.join("\n")
-  assert.ok(joined.includes("本项目附加评审要求（来自 .sdd-doc-sync-rules.md"))
-  assert.ok(joined.includes("  必须更新 CHANGELOG"))
-  assert.ok(joined.includes("已截断"))
+test("renderPromptTemplate：只替换动态占位符，不追加默认提示词", () => {
+  const text = renderPromptTemplate(
+    "CUSTOM {{pendingCount}}\n{{pendingItems}}\nTODO={{todoFile}}",
+    [{ path: "src/a.ts", reason: "Edit" }],
+    ".git/sdd-doc-sync/.sdd-doc-sync.md",
+  )
+  assert.strictEqual(text, "CUSTOM 1\n  - src/a.ts — Edit\nTODO=.git/sdd-doc-sync/.sdd-doc-sync.md")
 })
 
-test("loadRules：默认约定文件 / env 覆盖 / 缺失 / 超长截断", () => {
+test("loadRules：仓库根模板优先，其次插件同级模板，都不存在则返回 null", () => {
   const root = mkSddRepo()
-  assert.strictEqual(loadRules(root, {}), null) // 无文件 → null
+  const pluginDir = fs.mkdtempSync(path.join(os.tmpdir(), "sdd-doc-sync-plugin-"))
+  const emptyPluginDir = fs.mkdtempSync(path.join(os.tmpdir(), "sdd-doc-sync-empty-plugin-"))
+  try {
+    assert.strictEqual(loadRules(root, {}, emptyPluginDir), null)
 
-  // 默认约定文件
-  fs.writeFileSync(path.join(root, ".sdd-doc-sync-rules.md"), "- 必须更新 CHANGELOG\n- 标注 @since\n")
-  const r = loadRules(root, {})
-  assert.deepStrictEqual(r.lines, ["- 必须更新 CHANGELOG", "- 标注 @since"])
-  assert.strictEqual(r.truncated, false)
-  assert.strictEqual(r.relPath, ".sdd-doc-sync-rules.md")
+    fs.writeFileSync(path.join(pluginDir, ".sdd-doc-sync-rules.md"), "PLUGIN {{pendingItems}}")
+    const pluginRules = loadRules(root, {}, pluginDir)
+    assert.strictEqual(pluginRules.text, "PLUGIN {{pendingItems}}")
 
-  // env 覆盖（相对路径按 repoRoot 解析）
-  fs.writeFileSync(path.join(root, "custom.md"), "- 覆盖规则\n")
-  const r2 = loadRules(root, { SDD_DOC_SYNC_RULES_FILE: "custom.md" })
-  assert.deepStrictEqual(r2.lines, ["- 覆盖规则"])
+    fs.writeFileSync(path.join(root, ".sdd-doc-sync-rules.md"), "ROOT {{pendingItems}}")
+    const rootRules = loadRules(root, {}, pluginDir)
+    assert.strictEqual(rootRules.relPath, ".sdd-doc-sync-rules.md")
+    assert.strictEqual(rootRules.text, "ROOT {{pendingItems}}")
 
-  // 超长 → 截断标记
-  fs.writeFileSync(path.join(root, ".sdd-doc-sync-rules.md"), "x".repeat(5000))
-  assert.strictEqual(loadRules(root, {}).truncated, true)
+    fs.writeFileSync(path.join(root, "custom.md"), "ENV {{pendingItems}}")
+    const envRules = loadRules(root, { SDD_DOC_SYNC_RULES_FILE: "custom.md" }, pluginDir)
+    assert.strictEqual(envRules.relPath, "custom.md")
+    assert.strictEqual(envRules.text, "ENV {{pendingItems}}")
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+    fs.rmSync(pluginDir, { recursive: true, force: true })
+    fs.rmSync(emptyPluginDir, { recursive: true, force: true })
+  }
 })
 
-test("示例规则文件可复制为仓库默认规则", () => {
+test("示例模板文件可复制为仓库根完整 Stop prompt 模板", () => {
   const root = mkSddRepo()
   try {
     fs.copyFileSync(
@@ -268,39 +315,50 @@ test("示例规则文件可复制为仓库默认规则", () => {
       path.join(root, ".sdd-doc-sync-rules.md"),
     )
     const r = loadRules(root, {})
+    const rendered = buildStopPrompt([{ path: "src/example.ts", reason: "Write" }], r.text, todoRefFor(root))
     assert.strictEqual(r.relPath, ".sdd-doc-sync-rules.md")
-    assert.deepStrictEqual(r.lines, [
-      "- 公共 API 或导出函数签名变化时，必须同步 design.md。",
-      "- 新增用户可见行为或业务规则时，必须同步 tasks.md。",
-      "- 纯重构无需改文档，但要在 .sdd-doc-sync.md 写清“行为不变”的依据。",
-    ])
+    assert.ok(rendered.includes("[SDD-DOC-SYNC: 待同步评审]"))
+    assert.ok(rendered.includes("src/example.ts — Write"))
+    assert.ok(rendered.includes(".git/sdd-doc-sync/.sdd-doc-sync.md"))
+    assert.ok(!rendered.includes("{{pendingItems}}"))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
 
-test("rulesPathFor：env 优先、绝对路径直用、否则约定默认名", () => {
-  assert.ok(rulesPathFor("/repo", {}).endsWith(".sdd-doc-sync-rules.md"))
-  assert.strictEqual(rulesPathFor("/repo", { SDD_DOC_SYNC_RULES_FILE: "/abs/rules.md" }), "/abs/rules.md")
+test("rulesPathFor：env 优先、仓库根优先于插件同级目录", () => {
+  const root = mkSddRepo()
+  const pluginDir = fs.mkdtempSync(path.join(os.tmpdir(), "sdd-doc-sync-plugin-"))
+  try {
+    fs.writeFileSync(path.join(pluginDir, ".sdd-doc-sync-rules.md"), "PLUGIN")
+    assert.strictEqual(rulesPathFor(root, {}, pluginDir), path.join(pluginDir, ".sdd-doc-sync-rules.md"))
+    fs.writeFileSync(path.join(root, ".sdd-doc-sync-rules.md"), "ROOT")
+    assert.strictEqual(rulesPathFor(root, {}, pluginDir), path.join(root, ".sdd-doc-sync-rules.md"))
+    assert.strictEqual(rulesPathFor(root, { SDD_DOC_SYNC_RULES_FILE: "/abs/rules.md" }, pluginDir), "/abs/rules.md")
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+    fs.rmSync(pluginDir, { recursive: true, force: true })
+  }
 })
 
-test("Stop 集成：有规则文件 → 评审提示词追加项目附加评审要求", () => {
+test("Stop 集成：仓库根模板完全覆盖默认提示词", () => {
   const root = mkSddRepo()
-  fs.writeFileSync(path.join(root, ".sdd-doc-sync-rules.md"), "- 必须更新 CHANGELOG\n")
+  fs.writeFileSync(path.join(root, ".sdd-doc-sync-rules.md"), "CUSTOM ONLY\n{{pendingCount}}\n{{pendingItems}}\n{{todoFile}}")
   handleEvent(postEdit("src/foo.ts"), root)
   const res = handleEvent({ hook_event_name: "Stop" }, root)
   assert.ok(res && res.decision === "block")
-  assert.ok(res.reason.includes("本项目附加评审要求"))
-  assert.ok(res.reason.includes("必须更新 CHANGELOG"))
+  assert.ok(res.reason.startsWith("CUSTOM ONLY\n1\n  - src/foo.ts"))
+  assert.ok(res.reason.includes(".git/sdd-doc-sync/.sdd-doc-sync.md"))
+  assert.ok(!res.reason.includes("评审纪律"))
 })
 
-test("Stop 集成：env 覆盖规则文件路径", () => {
+test("Stop 集成：env 覆盖模板文件路径", () => {
   const root = mkSddRepo()
   const abs = path.join(root, "team-rules.md")
-  fs.writeFileSync(abs, "- 团队规则：先更新 design\n")
+  fs.writeFileSync(abs, "ENV ONLY {{pendingItems}}")
   handleEvent(postEdit("src/foo.ts"), root)
   const res = handleEvent({ hook_event_name: "Stop" }, root, { SDD_DOC_SYNC_RULES_FILE: abs })
-  assert.ok(res.reason.includes("团队规则：先更新 design"))
+  assert.strictEqual(res.reason, "ENV ONLY   - src/foo.ts — Edit")
 })
 
 // OpenCode native plugin adapter
@@ -316,6 +374,7 @@ test("OpenCode chat.message + edit tool registers a code file with the user prom
       { message: { role: "user" }, parts: [{ type: "text", text: "fix login flow" }] }
     )
     assert.strictEqual(JSON.parse(fs.readFileSync(statePathFor(root), "utf8")).lastPrompt, "fix login flow")
+    assert.strictEqual(fs.existsSync(path.join(root, ".sdd-doc-sync-state.json")), false)
 
     await hooks["tool.execute.before"](
       { tool: "edit", sessionID: "session-A", callID: "call-A" },
@@ -406,9 +465,10 @@ test("OpenCode adapter extracts apply_patch paths and records them as edits", as
 test("OpenCode idle event sends the Stop review prompt as an automatic session message", async () => {
   const root = mkSddRepo()
   const prompts = []
+  const toasts = []
   try {
     handleEvent(postEdit("src/foo.ts"), root)
-    const hooks = await makeOpenCodeHooks(root, prompts)
+    const hooks = await makeOpenCodeHooks(root, prompts, [], toasts)
     await hooks["chat.message"](
       {
         sessionID: "session-idle",
@@ -435,6 +495,26 @@ test("OpenCode idle event sends the Stop review prompt as an automatic session m
     assert.strictEqual(prompts[0].body.parts[0].metadata.source, "sdd-doc-sync-opencode")
     assert.ok(prompts[0].body.parts[0].text.includes("[SDD-DOC-SYNC"))
     assert.ok(prompts[0].body.parts[0].text.includes("src/foo.ts"))
+    assert.ok(prompts[0].body.parts[0].text.includes(".git/sdd-doc-sync/.sdd-doc-sync.md"))
+
+    const outbox = readJsonl(opencodePrivate.outboxPathFor(root))
+    assert.strictEqual(outbox.length, 2)
+    assert.strictEqual(opencodePrivate.outboxPathFor(root), path.join(root, ".git", "sdd-doc-sync", ".sdd-doc-sync-outbox.jsonl"))
+    assert.strictEqual(fs.existsSync(path.join(root, ".sdd-doc-sync-outbox.jsonl")), false)
+    assert.strictEqual(outbox[0].status, "queued")
+    assert.strictEqual(outbox[1].status, "sent")
+    assert.strictEqual(outbox[0].id, outbox[1].id)
+    assert.strictEqual(outbox[0].sessionID, "session-idle")
+    assert.strictEqual(outbox[0].reason, "automatic-stop-review")
+    assert.strictEqual(outbox[0].pendingCount, 1)
+    assert.strictEqual(outbox[0].message, prompts[0].body.parts[0].text)
+    assert.strictEqual(outbox[1].message, prompts[0].body.parts[0].text)
+    assert.strictEqual(toasts.length, 1)
+    assert.strictEqual(toasts[0].body.title, "SDD doc-sync reminder sent")
+    assert.ok(toasts[0].body.message.includes(".git/sdd-doc-sync/.sdd-doc-sync-outbox.jsonl"))
+    assert.ok(toasts[0].body.message.includes(".sdd-doc-sync-outbox.jsonl"))
+    assert.ok(!toasts[0].body.message.includes("[SDD-DOC-SYNC"))
+    assert.ok(!toasts[0].body.message.includes("src/foo.ts"))
 
     await hooks.event({
       event: {
@@ -443,6 +523,80 @@ test("OpenCode idle event sends the Stop review prompt as an automatic session m
       },
     })
     assert.strictEqual(prompts.length, 1)
+    assert.strictEqual(readJsonl(opencodePrivate.outboxPathFor(root)).length, 2)
+    assert.strictEqual(toasts.length, 1)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("OpenCode idle event records failed automatic Stop review prompts without changing the prompt payload", async () => {
+  const root = mkSddRepo()
+  const prompts = []
+  const logs = []
+  const toasts = []
+  try {
+    handleEvent(postEdit("src/failing.ts"), root)
+    const hooks = await SddDocSyncOpenCode({
+      directory: root,
+      worktree: root,
+      client: {
+        app: {
+          log: async (entry) => logs.push(entry),
+        },
+        tui: {
+          showToast: async (entry) => toasts.push(entry),
+        },
+        session: {
+          promptAsync: async (payload) => {
+            prompts.push(payload)
+            throw new Error("prompt transport down")
+          },
+        },
+      },
+    })
+
+    await hooks.event({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "session-failed" },
+      },
+    })
+
+    assert.strictEqual(prompts.length, 2, "v1 payload and flat fallback were both attempted")
+    const outbox = readJsonl(opencodePrivate.outboxPathFor(root))
+    assert.strictEqual(outbox.length, 2)
+    assert.strictEqual(outbox[0].status, "queued")
+    assert.strictEqual(outbox[1].status, "failed")
+    assert.strictEqual(outbox[0].id, outbox[1].id)
+    assert.strictEqual(outbox[0].message, prompts[0].body.parts[0].text)
+    assert.strictEqual(outbox[1].message, prompts[0].body.parts[0].text)
+    assert.ok(outbox[1].error.includes("prompt transport down"))
+    assert.strictEqual(toasts.length, 1)
+    assert.strictEqual(toasts[0].body.title, "SDD doc-sync reminder queued")
+    assert.ok(!toasts[0].body.message.includes("[SDD-DOC-SYNC"))
+    assert.ok(logs.some((entry) => entry.body?.message === "automatic Stop review continuation failed"))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("OpenCode idle event without pending items does not write outbox or toast", async () => {
+  const root = mkSddRepo()
+  const prompts = []
+  const toasts = []
+  try {
+    const hooks = await makeOpenCodeHooks(root, prompts, [], toasts)
+    await hooks.event({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "session-empty" },
+      },
+    })
+
+    assert.strictEqual(prompts.length, 0)
+    assert.strictEqual(toasts.length, 0)
+    assert.strictEqual(fs.existsSync(opencodePrivate.outboxPathFor(root)), false)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

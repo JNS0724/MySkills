@@ -4,12 +4,16 @@ const require = __sddCreateRequire(import.meta.url)
 
 const fs = require("node:fs")
 const path = require("node:path")
+const { fileURLToPath } = require("node:url")
+
+const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url))
 
 const TODO_FILE = ".sdd-doc-sync.md"
 const STATE_FILE = ".sdd-doc-sync-state.json"
+const OUTBOX_FILE = ".sdd-doc-sync-outbox.jsonl"
+const GENERATED_DIR = "sdd-doc-sync"
 const RULES_FILE = ".sdd-doc-sync-rules.md"
 const RULES_ENV = "SDD_DOC_SYNC_RULES_FILE"
-const RULES_MAX_BYTES = 4096
 const HEADER = "# SDD 文档同步评审（自动维护：代码改动后在此登记；勾选 [x] = 已评审/已同步）"
 const SANITIZE_MAX = 300
 const LAST_PROMPT_MAX = 120
@@ -121,28 +125,17 @@ const upsertPending = (text, rawPath, rawReason) => {
   return joinTodo(ensureHeader([...lines, newLine]))
 }
 
-const buildRulesSegment = (rules) => {
-  if (!rules || !Array.isArray(rules.lines) || rules.lines.length === 0) return []
-  const seg = [
-    "",
-    `本项目附加评审要求（来自 ${rules.relPath}，必须逐条评估；是否偏差仍由你判断）:`,
-    ...rules.lines.map((l) => `  ${l}`),
-  ]
-  if (rules.truncated) seg.push(`  （规则文件超长，已截断；完整内容见 ${rules.relPath}）`)
-  return seg
-}
-
-const buildStopPrompt = (items, rules) => {
-  const list = items.map((it) => {
+const renderPendingItems = (items) =>
+  items.map((it) => {
     const reason = sanitize(it.reason)
     return `  - ${sanitize(it.path)}${reason ? ` — ${reason}` : ""}`
-  })
-  return [
+  }).join("\n")
+
+const DEFAULT_STOP_PROMPT_TEMPLATE = [
     "[SDD-DOC-SYNC: 待同步评审]",
-    `收尾前检测到 ${items.length} 个代码文件已改动，文档可能落后。请在结束前逐项评审。`,
+    "收尾前检测到 {{pendingCount}} 个代码文件已改动，文档可能落后。请在结束前逐项评审。",
     "待评审：",
-    ...list,
-    ...buildRulesSegment(rules),
+    "{{pendingItems}}",
     "",
     "评审纪律：你是唯一裁判；下结论前必须先取证，不接受裸判断。对每个待评审文件按此结构处理：",
     "  1. 读取该代码文件，引用具体关键实现（函数/行为）。",
@@ -150,13 +143,32 @@ const buildStopPrompt = (items, rules) => {
     "  3. 判断代码与文档是否一致，指出冲突点，或写“经对照无冲突”。",
     "  4. 结论：",
     "     - 代码领先文档：直接编辑 design.md / tasks.md 使其同步。",
-    "     - 一致 / 纯重构 / 无关：在 .sdd-doc-sync.md 把该行 [ ] 改为 [x]，并在 — 后补一条包含第 3 步依据的理由。",
+    "     - 一致 / 纯重构 / 无关：在 {{todoFile}} 把该行 [ ] 改为 [x]，并在 — 后补一条包含第 3 步依据的理由。",
     "",
     "最终门槛（必须做到）：",
     "  1. 同步文档后，你新改动的文件也要重新评审。",
-    "  2. .sdd-doc-sync.md 仍有 [ ] 时，不要说已经完成同步，要说明还剩哪些。",
-    "  3. 清除待评审项的唯一方式 = 在 .sdd-doc-sync.md 把对应行 [ ] 改为 [x] 并附理由。",
-  ].join("\n")
+    "  2. {{todoFile}} 仍有 [ ] 时，不要说已经完成同步，要说明还剩哪些。",
+    "  3. 清除待评审项的唯一方式 = 在 {{todoFile}} 把对应行 [ ] 改为 [x] 并附理由。",
+].join("\n")
+
+const renderPromptTemplate = (template, items, todoRef = TODO_FILE) => {
+  const values = {
+    pendingCount: String(Array.isArray(items) ? items.length : 0),
+    pendingItems: renderPendingItems(Array.isArray(items) ? items : []),
+    todoFile: sanitize(todoRef || TODO_FILE),
+  }
+  return String(template == null ? "" : template).replace(/\{\{\s*(pendingCount|pendingItems|todoFile)\s*\}\}/g, (_m, key) => values[key])
+}
+
+const buildRulesSegment = () => []
+const promptTemplateText = (promptTemplate) =>
+  promptTemplate && typeof promptTemplate === "object" && typeof promptTemplate.text === "string"
+    ? promptTemplate.text
+    : promptTemplate
+
+const buildStopPrompt = (items, promptTemplate = DEFAULT_STOP_PROMPT_TEMPLATE, todoRef = TODO_FILE) => {
+  const text = promptTemplateText(promptTemplate)
+  return renderPromptTemplate(text == null ? DEFAULT_STOP_PROMPT_TEMPLATE : text, items, todoRef)
 }
 
 const editedPathFromEvent = (event) => {
@@ -175,6 +187,39 @@ const existsDir = (p) => {
     return false
   }
 }
+
+const existsFile = (p) => {
+  try {
+    return fs.statSync(p).isFile()
+  } catch {
+    return false
+  }
+}
+
+const gitDirFor = (repoRoot) => {
+  const dotGit = path.join(repoRoot, ".git")
+  try {
+    if (fs.statSync(dotGit).isDirectory()) return dotGit
+  } catch {
+    /* ignore */
+  }
+  try {
+    const m = /^gitdir:\s*(.+)$/i.exec(fs.readFileSync(dotGit, "utf8").trim())
+    if (!m) return null
+    const gitDir = m[1].trim()
+    return path.isAbsolute(gitDir) ? gitDir : path.resolve(repoRoot, gitDir)
+  } catch {
+    return null
+  }
+}
+
+const generatedDirFor = (repoRoot) => {
+  const gitDir = gitDirFor(repoRoot)
+  return gitDir ? path.join(gitDir, GENERATED_DIR) : path.join(repoRoot, ".sdd-doc-sync")
+}
+
+const generatedPathFor = (repoRoot, fileName) => path.join(generatedDirFor(repoRoot), fileName)
+const legacyGeneratedPathFor = (repoRoot, fileName) => path.join(repoRoot, fileName)
 
 const findRepoRoot = (start) => {
   let dir = path.resolve(start || ".")
@@ -216,8 +261,18 @@ const discoverChangeDirs = (repoRoot) => {
 }
 
 const isSddProject = (repoRoot) => discoverChangeDirs(repoRoot).length > 0
-const todoPathFor = (repoRoot) => path.join(repoRoot, TODO_FILE)
-const statePathFor = (repoRoot) => path.join(repoRoot, STATE_FILE)
+const todoPathFor = (repoRoot) => generatedPathFor(repoRoot, TODO_FILE)
+const statePathFor = (repoRoot) => generatedPathFor(repoRoot, STATE_FILE)
+const outboxPathFor = (repoRoot) => generatedPathFor(repoRoot, OUTBOX_FILE)
+
+const generatedPathRefFor = (repoRoot, fileName) => {
+  const abs = generatedPathFor(repoRoot, fileName)
+  const rel = toPosix(path.relative(repoRoot, abs))
+  return rel && !rel.startsWith("..") ? rel : toPosix(abs)
+}
+
+const todoRefFor = (repoRoot) => generatedPathRefFor(repoRoot, TODO_FILE)
+const outboxRefFor = (repoRoot) => generatedPathRefFor(repoRoot, OUTBOX_FILE)
 
 const readFileSafe = (file) => {
   try {
@@ -227,9 +282,19 @@ const readFileSafe = (file) => {
   }
 }
 
+const readGeneratedFileSafe = (repoRoot, fileName) => {
+  const primary = generatedPathFor(repoRoot, fileName)
+  try {
+    return fs.readFileSync(primary, "utf8")
+  } catch {
+    return readFileSafe(legacyGeneratedPathFor(repoRoot, fileName))
+  }
+}
+
 const writeFileAtomic = (file, text) => {
   const tmp = `${file}.tmp.${process.pid}`
   try {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(tmp, text)
     try {
       fs.renameSync(tmp, file)
@@ -258,7 +323,7 @@ const writeFileAtomic = (file, text) => {
 
 const loadLastPrompt = (repoRoot) => {
   try {
-    const data = JSON.parse(fs.readFileSync(statePathFor(repoRoot), "utf8"))
+    const data = JSON.parse(readGeneratedFileSafe(repoRoot, STATE_FILE))
     return typeof data.lastPrompt === "string" ? data.lastPrompt : ""
   } catch {
     return ""
@@ -269,34 +334,35 @@ const saveLastPrompt = (repoRoot, prompt) => {
   writeFileAtomic(statePathFor(repoRoot), JSON.stringify({ lastPrompt: sanitize(prompt).slice(0, LAST_PROMPT_MAX) }))
 }
 
-const rulesPathFor = (repoRoot, env = process.env) => {
-  const override = String((env && env[RULES_ENV]) || "").trim()
-  if (override) return path.isAbsolute(override) ? override : path.join(repoRoot, override)
-  return path.join(repoRoot, RULES_FILE)
-}
-
-const loadRules = (repoRoot, env = process.env) => {
-  const abs = rulesPathFor(repoRoot, env)
-  let raw
-  try {
-    raw = fs.readFileSync(abs, "utf8")
-  } catch {
-    return null
-  }
-  if (!raw || !raw.trim()) return null
-  const truncated = Buffer.byteLength(raw, "utf8") > RULES_MAX_BYTES
-  const body = truncated ? byteSlice(raw, RULES_MAX_BYTES) : raw
-  const lines = body.split(/\r?\n/).map(sanitizeLine)
-  while (lines.length && lines[lines.length - 1] === "") lines.pop()
-  if (lines.length === 0) return null
+const relPathFor = (repoRoot, abs, fallback = RULES_FILE) => {
   let relPath
   try {
     relPath = toPosix(path.relative(repoRoot, abs))
   } catch {
-    relPath = RULES_FILE
+    relPath = fallback
   }
   if (!relPath || relPath.startsWith("..")) relPath = toPosix(abs)
-  return { relPath: sanitize(relPath), lines, truncated }
+  return sanitize(relPath)
+}
+
+const rulesPathFor = (repoRoot, env = process.env, pluginDir = PLUGIN_DIR) => {
+  const override = String((env && env[RULES_ENV]) || "").trim()
+  if (override) return path.isAbsolute(override) ? override : path.join(repoRoot, override)
+  const repoRules = path.join(repoRoot, RULES_FILE)
+  if (existsFile(repoRules)) return repoRules
+  const pluginRules = path.join(pluginDir || PLUGIN_DIR, RULES_FILE)
+  if (existsFile(pluginRules)) return pluginRules
+  return repoRules
+}
+
+const loadRules = (repoRoot, env = process.env, pluginDir = PLUGIN_DIR) => {
+  const abs = rulesPathFor(repoRoot, env, pluginDir)
+  if (!existsFile(abs)) return null
+  try {
+    return { relPath: relPathFor(repoRoot, abs), text: fs.readFileSync(abs, "utf8") }
+  } catch {
+    return null
+  }
 }
 
 const handleEvent = (event, repoRoot, env = process.env) => {
@@ -318,7 +384,7 @@ const handleEvent = (event, repoRoot, env = process.env) => {
     const last = loadLastPrompt(repoRoot)
     const reason = `${tool}${last ? ` · ${last}` : ""}`
     const file = todoPathFor(repoRoot)
-    const before = readFileSafe(file)
+    const before = readGeneratedFileSafe(repoRoot, TODO_FILE)
     const after = upsertPending(before, rel, reason)
     if (after !== before) writeFileAtomic(file, after)
     return null
@@ -326,9 +392,10 @@ const handleEvent = (event, repoRoot, env = process.env) => {
 
   if (hook === "Stop") {
     if (event && (event.stop_hook_active || event.stopHookActive)) return null
-    const items = pendingItems(readFileSafe(todoPathFor(repoRoot)))
+    const items = pendingItems(readGeneratedFileSafe(repoRoot, TODO_FILE))
     if (items.length === 0) return null
-    return { decision: "block", reason: buildStopPrompt(items, loadRules(repoRoot, env)) }
+    const template = loadRules(repoRoot, env)
+    return { decision: "block", reason: buildStopPrompt(items, template ? template.text : null, todoRefFor(repoRoot)) }
   }
 
   return null
@@ -459,6 +526,25 @@ const compactText = (value, max = 1000) => {
   return text.length > max ? `${text.slice(0, max)}...` : text
 }
 
+const makeOutboxID = () =>
+  `sdd-doc-sync-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+
+const appendOutboxRecord = (repoRoot, record) => {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    id: record.id || makeOutboxID(),
+    sessionID: String(record.sessionID || "default"),
+    status: record.status,
+    reason: String(record.reason || ""),
+    message: String(record.message || ""),
+    pendingCount: Number.isFinite(record.pendingCount) ? record.pendingCount : 0,
+  }
+  if (record.error) entry.error = compactText(record.error, 500)
+  fs.mkdirSync(path.dirname(outboxPathFor(repoRoot)), { recursive: true })
+  fs.appendFileSync(outboxPathFor(repoRoot), `${JSON.stringify(entry)}\n`, "utf8")
+  return entry
+}
+
 const logPluginIssue = async (client, level, message, extra = {}) => {
   try {
     await client?.app?.log?.({
@@ -471,6 +557,40 @@ const logPluginIssue = async (client, level, message, extra = {}) => {
     })
   } catch {
     // Keep OpenCode sessions quiet when app logging is unavailable.
+  }
+}
+
+const recordOutboxEvent = async (client, repoRoot, record) => {
+  try {
+    return appendOutboxRecord(repoRoot, record)
+  } catch (error) {
+    await logPluginIssue(client, "warn", "automatic Stop review outbox write failed", {
+      sessionID: record?.sessionID,
+      status: record?.status,
+      error: compactText(error?.message || String(error)),
+    })
+    return null
+  }
+}
+
+const showOutboxToast = async (client, repoRoot, status, pendingCount) => {
+  const fn = client?.tui?.showToast
+  if (typeof fn !== "function") return
+  const sent = status === "sent"
+  try {
+    await fn({
+      body: {
+        title: sent ? "SDD doc-sync reminder sent" : "SDD doc-sync reminder queued",
+        message: `${pendingCount} pending items; see ${outboxRefFor(repoRoot)}`,
+        variant: sent ? "success" : "warning",
+        duration: 5000,
+      },
+    })
+  } catch (error) {
+    await logPluginIssue(client, "warn", "automatic Stop review toast failed", {
+      status,
+      error: compactText(error?.message || String(error)),
+    })
   }
 }
 
@@ -720,14 +840,42 @@ const SddDocSyncOpenCode = async (ctx = {}) => {
         return
       }
 
+      const repoRoot = findRepoRoot(normalizeCwd(ctx))
+      const pendingCount = pendingItems(readGeneratedFileSafe(repoRoot, TODO_FILE)).length
+      const outboxBase = {
+        id: makeOutboxID(),
+        sessionID: idle.sessionID,
+        reason: "automatic-stop-review",
+        message: prompt,
+        pendingCount,
+      }
+      await recordOutboxEvent(ctx.client, repoRoot, { ...outboxBase, status: "queued" })
+
       try {
         const injected = await promptSessionCompat(ctx, idle.sessionID, prompt, sessionOptionsByID.get(idle.sessionID))
+        if (injected) {
+          await recordOutboxEvent(ctx.client, repoRoot, { ...outboxBase, status: "sent" })
+          await showOutboxToast(ctx.client, repoRoot, "sent", pendingCount)
+        } else {
+          await recordOutboxEvent(ctx.client, repoRoot, {
+            ...outboxBase,
+            status: "failed",
+            error: "session prompt API unavailable",
+          })
+          await showOutboxToast(ctx.client, repoRoot, "queued", pendingCount)
+        }
         await logPluginIssue(ctx.client, injected ? "info" : "warn", "sent automatic Stop review continuation", {
           sessionID: idle.sessionID,
           rawType: idle.rawType,
           injected,
         })
       } catch (error) {
+        await recordOutboxEvent(ctx.client, repoRoot, {
+          ...outboxBase,
+          status: "failed",
+          error: error?.message || String(error),
+        })
+        await showOutboxToast(ctx.client, repoRoot, "queued", pendingCount)
         await logPluginIssue(ctx.client, "warn", "automatic Stop review continuation failed", {
           sessionID: idle.sessionID,
           rawType: idle.rawType,
@@ -739,6 +887,8 @@ const SddDocSyncOpenCode = async (ctx = {}) => {
 }
 
 const privateApi = Object.assign(async () => ({}), {
+  DEFAULT_STOP_PROMPT_TEMPLATE,
+  PLUGIN_DIR,
   buildRulesSegment,
   buildPostToolUseInput,
   buildPromptInput,
@@ -749,8 +899,13 @@ const privateApi = Object.assign(async () => ({}), {
   contentText,
   discoverChangeDirs,
   editedPathFromEvent,
+  existsFile,
   extractToolArgs,
   findRepoRoot,
+  generatedDirFor,
+  generatedPathFor,
+  generatedPathRefFor,
+  gitDirFor,
   getSessionID,
   getToolCallID,
   getToolFilePath,
@@ -760,6 +915,13 @@ const privateApi = Object.assign(async () => ({}), {
   isUserChatMessage,
   isWriteTool,
   loadRules,
+  appendOutboxRecord,
+  outboxPathFor,
+  outboxRefFor,
+  readGeneratedFileSafe,
+  relPathFor,
+  renderPendingItems,
+  renderPromptTemplate,
   normalizeCwd,
   normalizeIdleEvent,
   normalizeToolArgs,
@@ -769,6 +931,7 @@ const privateApi = Object.assign(async () => ({}), {
   pendingItems,
   promptSession,
   promptSessionCompat,
+  promptTemplateText,
   runHookInput,
   rulesPathFor,
   sanitize,
@@ -777,6 +940,7 @@ const privateApi = Object.assign(async () => ({}), {
   statePathFor,
   takeCachedToolInput,
   todoPathFor,
+  todoRefFor,
   upsertPending,
 })
 export { SddDocSyncOpenCode, privateApi as _private }

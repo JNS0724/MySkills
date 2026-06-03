@@ -16,17 +16,19 @@
 const fs = require("fs")
 const path = require("path")
 
+const PLUGIN_DIR = __dirname
+
 // ── 常量 ──────────────────────────────────────────────────────────────────────
 const TODO_FILE = ".sdd-doc-sync.md"
 const STATE_FILE = ".sdd-doc-sync-state.json"
+const GENERATED_DIR = "sdd-doc-sync"
 const HEADER = "# SDD 文档同步评审（自动维护：代码改动后在此登记；勾选 [x] = 已评审/已同步）"
 const SANITIZE_MAX = 300
 const LAST_PROMPT_MAX = 120
-// 可选规则文件（小 trick）：动态往 Stop 评审提示词里追加"项目附加评审要求"。优先用
-// SDD_DOC_SYNC_RULES_FILE 指定的路径，否则取仓库根的 .sdd-doc-sync-rules.md。改文件即生效。
+// Stop prompt 模板文件。优先用 SDD_DOC_SYNC_RULES_FILE 指定的路径；否则先找仓库根，
+// 再找插件同级目录的 .sdd-doc-sync-rules.md。文件存在时，最终 prompt 完全由文件模板渲染。
 const RULES_FILE = ".sdd-doc-sync-rules.md"
 const RULES_ENV = "SDD_DOC_SYNC_RULES_FILE"
-const RULES_MAX_BYTES = 4096
 // `- [ ] path` 或 `- [x] path — 理由`。path 不含空白；理由可选。
 const TODO_LINE = /^- \[([ x])\] (\S+)(?: — (.*))?$/
 // SDD change-dir 约定（与 sdd-review-ledger 一致）。
@@ -60,8 +62,8 @@ const sanitize = (s) => {
   return out.trim().slice(0, SANITIZE_MAX)
 }
 
-// sanitizeLine：与 sanitize 一样剥离控制符/bidi，但用于规则文件的"每一行"——保留行内文本与
-// 左侧缩进，只去掉行尾空白并限长（不把多行塌成一行）。
+// sanitizeLine：与 sanitize 一样剥离控制符/bidi，但保留行内文本与左侧缩进。
+// 规则模板会按原文读取；这个工具保留给纯函数测试和未来局部模板片段使用。
 const sanitizeLine = (s) => {
   const input = String(s == null ? "" : s)
   let out = ""
@@ -153,33 +155,17 @@ const upsertPending = (text, rawPath, rawReason) => {
   return joinTodo(ensureHeader([...lines, newLine]))
 }
 
-// buildRulesSegment：把可选规则文件的内容渲染成"项目附加评审要求"段（纯函数）。无规则 → []，
-// 此时 buildStopPrompt 输出与未启用时逐字节一致（byte-stable）。
-const buildRulesSegment = (rules) => {
-  if (!rules || !Array.isArray(rules.lines) || rules.lines.length === 0) return []
-  const seg = [
-    "",
-    `本项目附加评审要求（来自 ${rules.relPath}，务必逐条一并满足；是否偏差仍由你判断）:`,
-    ...rules.lines.map((l) => `  ${l}`),
-  ]
-  if (rules.truncated) seg.push(`  （规则文件超长，已截断；完整内容见 ${rules.relPath}）`)
-  return seg
-}
-
-// buildStopPrompt：强硬的结构化评审提示词（Stop block 的 reason）。让模型先取证、再下结论，
-// 代码领先文档就直接改 design/tasks 同步。rules 可选：把项目附加评审要求插在待评审清单之后、
-// 通用评审纪律之前（靠前更易被遵循）。
-const buildStopPrompt = (items, rules) => {
-  const list = items.map((it) => {
+const renderPendingItems = (items) =>
+  items.map((it) => {
     const reason = sanitize(it.reason)
     return `  - ${sanitize(it.path)}${reason ? ` — ${reason}` : ""}`
-  })
-  return [
+  }).join("\n")
+
+const DEFAULT_STOP_PROMPT_TEMPLATE = [
     "[SDD-DOC-SYNC: 待同步评审]",
-    `收尾前检测到 ${items.length} 个代码文件已改动、文档可能落后，请在结束本回合前逐项评审：`,
+    "收尾前检测到 {{pendingCount}} 个代码文件已改动、文档可能落后，请在结束本回合前逐项评审：",
     "待评审：",
-    ...list,
-    ...buildRulesSegment(rules),
+    "{{pendingItems}}",
     "",
     "评审纪律（你是唯一裁判；下结论前必须先取证，不接受裸判断）。对每个待评审文件，按此结构输出，最后才下结论：",
     "  1. 读取该代码文件，引用其当前关键实现（具体函数/行为）",
@@ -187,13 +173,34 @@ const buildStopPrompt = (items, rules) => {
     '  3. 二者是否一致？指出冲突点，或写"经对照无冲突"',
     "  4. 结论：",
     "     - 代码领先文档（design/tasks 未反映该实现）→ 直接编辑 design.md / tasks.md 使其同步（这就是本工具的目的）",
-    "     - 一致 / 纯重构 / 无关 → 在 .sdd-doc-sync.md 把该行 [ ] 改为 [x]，并在 — 后补一句含第 3 步依据的理由",
+    "     - 一致 / 纯重构 / 无关 → 在 {{todoFile}} 把该行 [ ] 改为 [x]，并在 — 后补一句含第 3 步依据的理由",
     "",
     "最终门槛（必做，勿略）：",
     "  ① 同步文档后你新改动的文件也要重新评审；",
-    '  ② .sdd-doc-sync.md 仍有 [ ] 未勾时，不要说"已完成同步"，要说明还剩哪些；',
-    "  ③ 清除待评审项的唯一方式 = 在 .sdd-doc-sync.md 把对应行 [ ] 改为 [x] 并附理由（编辑代码不自动清除，也不要手写新增 [ ] 行）。",
-  ].join("\n")
+    '  ② {{todoFile}} 仍有 [ ] 未勾时，不要说"已完成同步"，要说明还剩哪些；',
+    "  ③ 清除待评审项的唯一方式 = 在 {{todoFile}} 把对应行 [ ] 改为 [x] 并附理由（编辑代码不自动清除，也不要手写新增 [ ] 行）。",
+].join("\n")
+
+const renderPromptTemplate = (template, items, todoRef = TODO_FILE) => {
+  const values = {
+    pendingCount: String(Array.isArray(items) ? items.length : 0),
+    pendingItems: renderPendingItems(Array.isArray(items) ? items : []),
+    todoFile: sanitize(todoRef || TODO_FILE),
+  }
+  return String(template == null ? "" : template).replace(/\{\{\s*(pendingCount|pendingItems|todoFile)\s*\}\}/g, (_m, key) => values[key])
+}
+
+const buildRulesSegment = () => []
+const promptTemplateText = (promptTemplate) =>
+  promptTemplate && typeof promptTemplate === "object" && typeof promptTemplate.text === "string"
+    ? promptTemplate.text
+    : promptTemplate
+
+// buildStopPrompt：强硬的结构化评审提示词（Stop block 的 reason）。文件模板存在时完全按模板渲染；
+// 文件不存在时使用当前内置默认模板，保持历史行为。
+const buildStopPrompt = (items, promptTemplate = DEFAULT_STOP_PROMPT_TEMPLATE, todoRef = TODO_FILE) => {
+  const text = promptTemplateText(promptTemplate)
+  return renderPromptTemplate(text == null ? DEFAULT_STOP_PROMPT_TEMPLATE : text, items, todoRef)
 }
 
 // editedPathFromEvent：从 PostToolUse 事件取受改文件路径（Edit/Write 顶层 file_path；
@@ -216,6 +223,39 @@ const existsDir = (p) => {
     return false
   }
 }
+
+const existsFile = (p) => {
+  try {
+    return fs.statSync(p).isFile()
+  } catch {
+    return false
+  }
+}
+
+const gitDirFor = (repoRoot) => {
+  const dotGit = path.join(repoRoot, ".git")
+  try {
+    if (fs.statSync(dotGit).isDirectory()) return dotGit
+  } catch {
+    /* ignore */
+  }
+  try {
+    const m = /^gitdir:\s*(.+)$/i.exec(fs.readFileSync(dotGit, "utf8").trim())
+    if (!m) return null
+    const gitDir = m[1].trim()
+    return path.isAbsolute(gitDir) ? gitDir : path.resolve(repoRoot, gitDir)
+  } catch {
+    return null
+  }
+}
+
+const generatedDirFor = (repoRoot) => {
+  const gitDir = gitDirFor(repoRoot)
+  return gitDir ? path.join(gitDir, GENERATED_DIR) : path.join(repoRoot, ".sdd-doc-sync")
+}
+
+const generatedPathFor = (repoRoot, fileName) => path.join(generatedDirFor(repoRoot), fileName)
+const legacyGeneratedPathFor = (repoRoot, fileName) => path.join(repoRoot, fileName)
 
 // findRepoRoot：从 cwd 向上找 .git / sdd / .sdd 标记，找不到就用 cwd。
 const findRepoRoot = (start) => {
@@ -260,8 +300,16 @@ const discoverChangeDirs = (repoRoot) => {
 
 const isSddProject = (repoRoot) => discoverChangeDirs(repoRoot).length > 0
 
-const todoPathFor = (repoRoot) => path.join(repoRoot, TODO_FILE)
-const statePathFor = (repoRoot) => path.join(repoRoot, STATE_FILE)
+const todoPathFor = (repoRoot) => generatedPathFor(repoRoot, TODO_FILE)
+const statePathFor = (repoRoot) => generatedPathFor(repoRoot, STATE_FILE)
+
+const generatedPathRefFor = (repoRoot, fileName) => {
+  const abs = generatedPathFor(repoRoot, fileName)
+  const rel = toPosix(path.relative(repoRoot, abs))
+  return rel && !rel.startsWith("..") ? rel : toPosix(abs)
+}
+
+const todoRefFor = (repoRoot) => generatedPathRefFor(repoRoot, TODO_FILE)
 
 const readFileSafe = (file) => {
   try {
@@ -271,11 +319,21 @@ const readFileSafe = (file) => {
   }
 }
 
+const readGeneratedFileSafe = (repoRoot, fileName) => {
+  const primary = generatedPathFor(repoRoot, fileName)
+  try {
+    return fs.readFileSync(primary, "utf8")
+  } catch {
+    return readFileSafe(legacyGeneratedPathFor(repoRoot, fileName))
+  }
+}
+
 // writeFileAtomic：tmp + rename；Windows 下 rename 覆盖已存在文件会抛 EEXIST/EPERM，
 // 先 unlink 再重试一次。任何失败 → false（fail-open，调用方不依赖返回值）。
 const writeFileAtomic = (file, text) => {
   const tmp = `${file}.tmp.${process.pid}`
   try {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(tmp, text)
     try {
       fs.renameSync(tmp, file)
@@ -304,7 +362,7 @@ const writeFileAtomic = (file, text) => {
 
 const loadLastPrompt = (repoRoot) => {
   try {
-    const d = JSON.parse(fs.readFileSync(statePathFor(repoRoot), "utf8"))
+    const d = JSON.parse(readGeneratedFileSafe(repoRoot, STATE_FILE))
     return typeof d.lastPrompt === "string" ? d.lastPrompt : ""
   } catch {
     return ""
@@ -315,37 +373,37 @@ const saveLastPrompt = (repoRoot, prompt) => {
   writeFileAtomic(statePathFor(repoRoot), JSON.stringify({ lastPrompt: sanitize(prompt).slice(0, LAST_PROMPT_MAX) }))
 }
 
-// rulesPathFor：规则文件绝对路径。env 覆盖优先（相对路径按 repoRoot 解析），否则用约定的默认名。
-const rulesPathFor = (repoRoot, env = process.env) => {
-  const override = String((env && env[RULES_ENV]) || "").trim()
-  if (override) return path.isAbsolute(override) ? override : path.join(repoRoot, override)
-  return path.join(repoRoot, RULES_FILE)
-}
-
-// loadRules：读规则文件 → { relPath, lines, truncated } | null（fail-open）。空/缺失/读不出 → null。
-// 按字节上限码点安全截断，逐行消毒，去掉尾随空行。
-const loadRules = (repoRoot, env = process.env) => {
-  const abs = rulesPathFor(repoRoot, env)
-  let raw
-  try {
-    raw = fs.readFileSync(abs, "utf8")
-  } catch {
-    return null
-  }
-  if (!raw || !raw.trim()) return null
-  const truncated = Buffer.byteLength(raw, "utf8") > RULES_MAX_BYTES
-  const body = truncated ? byteSlice(raw, RULES_MAX_BYTES) : raw
-  const lines = body.split(/\r?\n/).map(sanitizeLine)
-  while (lines.length && lines[lines.length - 1] === "") lines.pop()
-  if (lines.length === 0) return null
+const relPathFor = (repoRoot, abs, fallback = RULES_FILE) => {
   let relPath
   try {
     relPath = toPosix(path.relative(repoRoot, abs))
   } catch {
-    relPath = RULES_FILE
+    relPath = fallback
   }
   if (!relPath || relPath.startsWith("..")) relPath = toPosix(abs)
-  return { relPath: sanitize(relPath), lines, truncated }
+  return sanitize(relPath)
+}
+
+// rulesPathFor：Stop prompt 模板文件绝对路径。env 覆盖优先；否则仓库根优先于插件同级目录。
+const rulesPathFor = (repoRoot, env = process.env, pluginDir = PLUGIN_DIR) => {
+  const override = String((env && env[RULES_ENV]) || "").trim()
+  if (override) return path.isAbsolute(override) ? override : path.join(repoRoot, override)
+  const repoRules = path.join(repoRoot, RULES_FILE)
+  if (existsFile(repoRules)) return repoRules
+  const pluginRules = path.join(pluginDir || PLUGIN_DIR, RULES_FILE)
+  if (existsFile(pluginRules)) return pluginRules
+  return repoRules
+}
+
+// loadRules：读完整 Stop prompt 模板 → { relPath, text } | null。文件存在时不会追加默认提示词。
+const loadRules = (repoRoot, env = process.env, pluginDir = PLUGIN_DIR) => {
+  const abs = rulesPathFor(repoRoot, env, pluginDir)
+  if (!existsFile(abs)) return null
+  try {
+    return { relPath: relPathFor(repoRoot, abs), text: fs.readFileSync(abs, "utf8") }
+  } catch {
+    return null
+  }
 }
 
 // ── 事件处理（纯：给定 event + repoRoot → hook 输出对象或 null） ──────────────────
@@ -369,7 +427,7 @@ const handleEvent = (event, repoRoot, env = process.env) => {
     const last = loadLastPrompt(repoRoot)
     const reason = `${tool}${last ? ` · ${last}` : ""}`
     const file = todoPathFor(repoRoot)
-    const before = readFileSafe(file)
+    const before = readGeneratedFileSafe(repoRoot, TODO_FILE)
     const after = upsertPending(before, rel, reason)
     if (after !== before) writeFileAtomic(file, after)
     return null // 静默：评审统一推到 Stop，不打断开发
@@ -377,9 +435,10 @@ const handleEvent = (event, repoRoot, env = process.env) => {
 
   if (hook === "Stop") {
     if (event && (event.stop_hook_active || event.stopHookActive)) return null // 至多打断一次
-    const items = pendingItems(readFileSafe(todoPathFor(repoRoot)))
+    const items = pendingItems(readGeneratedFileSafe(repoRoot, TODO_FILE))
     if (items.length === 0) return null
-    return { decision: "block", reason: buildStopPrompt(items, loadRules(repoRoot, env)) }
+    const template = loadRules(repoRoot, env)
+    return { decision: "block", reason: buildStopPrompt(items, template ? template.text : null, todoRefFor(repoRoot)) }
   }
 
   return null
@@ -441,8 +500,10 @@ const main = async () => {
 module.exports = {
   TODO_FILE,
   STATE_FILE,
+  GENERATED_DIR,
   RULES_FILE,
   RULES_ENV,
+  PLUGIN_DIR,
   HEADER,
   TODO_LINE,
   toPosix,
@@ -453,14 +514,27 @@ module.exports = {
   parseTodo,
   pendingItems,
   upsertPending,
+  DEFAULT_STOP_PROMPT_TEMPLATE,
   buildRulesSegment,
   buildStopPrompt,
+  promptTemplateText,
+  renderPendingItems,
+  renderPromptTemplate,
   editedPathFromEvent,
+  existsFile,
   findRepoRoot,
   discoverChangeDirs,
   isSddProject,
+  gitDirFor,
+  generatedDirFor,
+  generatedPathFor,
+  generatedPathRefFor,
+  legacyGeneratedPathFor,
   todoPathFor,
+  todoRefFor,
   statePathFor,
+  readGeneratedFileSafe,
+  relPathFor,
   rulesPathFor,
   loadRules,
   loadLastPrompt,

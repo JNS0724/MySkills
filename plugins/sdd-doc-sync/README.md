@@ -8,7 +8,7 @@
 
 本插件只做一件事，机械地：
 
-1. 每次改**代码文件**，把它登记到仓库根的 `.sdd-doc-sync.md`（待评审清单）；
+1. 每次改**代码文件**，把它登记到 `.git/sdd-doc-sync/.sdd-doc-sync.md`（待评审清单）；
 2. 收尾（Stop）时，如果还有未评审的改动，用一段**强硬的结构化提示词**拦一下，逼模型**自己去读这些代码 + 对应 `design.md`/`tasks.md`**，逐项取证对照；
 3. 代码领先文档 → 敦促模型**直接改文档同步**；一致/无关 → 在清单里把 `[ ]` 勾成 `[x]` 并附依据。勾选行就是**评审记录**。
 
@@ -63,45 +63,59 @@ Copy-Item E:\coding\sdd\SDD-plugins\plugins\sdd-doc-sync\sdd-doc-sync-opencode.j
 opencode
 ```
 
-插件会在当前工作目录向上寻找 SDD 工程标记（`sdd/changes` 或 `.sdd/changes`），并在工程根目录维护 `.sdd-doc-sync.md` 与 `.sdd-doc-sync-state.json`。
+插件会在当前工作目录向上寻找 SDD 工程标记（`sdd/changes` 或 `.sdd/changes`），并在 `.git/sdd-doc-sync/` 下维护运行时生成物。正常情况下用户不需要感知这些文件；需要排查时再查看即可。
 
 OpenCode 映射关系：
 
 - `chat.message`：记录本轮用户提示词，后续登记项会带上这个任务标签。
 - `tool.execute.after`：捕获 `edit` / `write` / `multiedit` / `patch` / `apply_patch`，登记受改代码文件。
-- `session.idle` / `session.status: idle`：发现 `.sdd-doc-sync.md` 仍有 `[ ]` 时，通过 `session.promptAsync` 自动向同一会话发送收尾评审提示，不依赖用户再手动触发下一轮。
+- `session.idle` / `session.status: idle`：发现内部清单仍有 `[ ]` 时，通过 `session.promptAsync` 自动向同一会话发送收尾评审提示，不依赖用户再手动触发下一轮；同时把实际发送的完整消息体写入 `.git/sdd-doc-sync/.sdd-doc-sync-outbox.jsonl`，并用 toast 显示一条短摘要。
 
-## 生成的文件（建议加进 `.gitignore`）
+## 生成的文件（默认在 `.git/sdd-doc-sync/`）
 
-- `.sdd-doc-sync.md` — 待评审/已评审清单（人可读、模型可编辑）。`- [ ]` = 待评审，`- [x] … — 理由` = 已评审记录。
-- `.sdd-doc-sync-state.json` — `{ "lastPrompt": "…" }`，仅作打标签用。
+- `.git/sdd-doc-sync/.sdd-doc-sync.md` — 待评审/已评审清单（模型可编辑）。`- [ ]` = 待评审，`- [x] … — 理由` = 已评审记录。
+- `.git/sdd-doc-sync/.sdd-doc-sync-state.json` — `{ "lastPrompt": "…" }`，仅作打标签用。
+- `.git/sdd-doc-sync/.sdd-doc-sync-outbox.jsonl` — OpenCode 自动 Stop 评审消息的本地透明度记录；每行是一次 `queued` / `sent` / `failed` 事件，`message` 字段保存实际发送给模型的完整文本。
 
-```gitignore
-.sdd-doc-sync.md
-.sdd-doc-sync-state.json
-```
+这些文件在普通 Git 仓库里已经位于 `.git` 下，不需要再加入 `.gitignore`。如果项目没有可解析的 `.git` 目录，插件会退回到仓库根的隐藏目录 `.sdd-doc-sync/`，避免创建一个假的 `.git`。
 
-## 动态增加评审要求（小 trick，可选）
+## 自定义 Stop prompt 模板
 
-在仓库根放一个 **`.sdd-doc-sync-rules.md`**，里面写本项目的额外评审要求（一行一条），它会被**原样注入**到 Stop 评审提示词的「本项目附加评审要求」段——插在待评审清单之后、通用评审纪律之前（靠前更易被遵循）。**改文件即生效**，下次 Stop 就用新内容，无需重启。
+`.sdd-doc-sync-rules.md` 现在是**完整 Stop prompt 模板**，不是附加规则段。文件存在时，最终发给模型的提示词完全由这个文件渲染，不会再自动拼接内置默认提示词；两个位置都不存在时，才使用插件内置的当前默认提示词。
 
-可以先复制本插件附带的极简示例：`plugins/sdd-doc-sync/.sdd-doc-sync-rules.example.md` → 仓库根 `.sdd-doc-sync-rules.md`，再按项目约定微调。
+查找优先级：
+
+1. `SDD_DOC_SYNC_RULES_FILE` 指定的路径（相对路径按仓库根解析）。
+2. 仓库根 `.sdd-doc-sync-rules.md`。
+3. 插件同级目录 `.sdd-doc-sync-rules.md`（例如 `.opencode/plugins/.sdd-doc-sync-rules.md`）。
+4. 都不存在 → 使用内置默认模板。
+
+模板支持三个占位符：
+
+- `{{pendingCount}}` — 待评审代码文件数量。
+- `{{pendingItems}}` — 待评审清单，每行形如 `  - src/foo.ts — Edit · 用户任务`。
+- `{{todoFile}}` — 内部评审清单路径，通常是 `.git/sdd-doc-sync/.sdd-doc-sync.md`。
+
+可以直接复制本插件附带的完整模板：`plugins/sdd-doc-sync/.sdd-doc-sync-rules.md` 或 `plugins/sdd-doc-sync/.sdd-doc-sync-rules.example.md` → 仓库根 `.sdd-doc-sync-rules.md`，再按项目约定微调。
 
 ```markdown
-- 公共 API 改动必须更新 design.md 的接口表
-- 任何新增配置项要写进 tasks.md 的配置清单
-- 涉及鉴权的改动，design 里要有对应的威胁模型说明
+[SDD-DOC-SYNC: 待同步评审]
+收尾前检测到 {{pendingCount}} 个代码文件已改动、文档可能落后，请在结束本回合前逐项评审：
+待评审：
+{{pendingItems}}
+
+……
 ```
 
-- 也可以用环境变量指定别的路径：`SDD_DOC_SYNC_RULES_FILE=docs/review-rules.md`（相对路径按仓库根解析；env 优先于约定的默认文件）。
+- 如果删掉 `{{pendingItems}}`，模型就不会在 prompt 中看到自动生成的待评审列表；这是允许的，因为文件内容就是最终模板。
 - 这份规则文件是**项目资产**，通常要 **git 提交**（团队共享），不要加进 `.gitignore`。
-- 上限约 4 KiB，超长会在提示词里显式标注「已截断」（不静默丢）。内容仅供参考，**是否偏差仍由模型判断**（不改变勾选清除逻辑）。
+- 模板不再做 4 KiB 截断；本地文件会按原文读取，只替换上面三个占位符。动态生成的路径/理由仍会做消毒。
 
 ## 工作流（你会看到什么）
 
 1. 你让模型改代码，模型一通 vibe coding，文档没动。
 2. 模型想结束这一回合 → 被 Stop 拦下，收到结构化评审清单：逐个文件「读代码 → 读 design/tasks → 是否一致 → 结论」。
-3. 模型发现代码领先 → 直接编辑 `design.md`/`tasks.md` 同步；或判定无关 → 在 `.sdd-doc-sync.md` 勾掉并写明依据。
+3. 模型发现代码领先 → 直接编辑 `design.md`/`tasks.md` 同步；或判定无关 → 在内部评审清单勾掉并写明依据。
 4. 清单清空后，回合正常结束。再改代码，循环重来。
 
 ## 约束 / 已知简化

@@ -19,9 +19,15 @@ $opencodeEntry = Join-Path $root "node_modules\opencode-ai\bin\opencode"
 $phaseRunner = Join-Path $root "scripts\run-opencode-phase.mjs"
 $configTemplate = Join-Path $root ".opencode\opencode.$Provider.jsonc.example"
 $pluginSource = Join-Path $repoRoot "plugins\sdd-doc-sync\sdd-doc-sync-opencode.js"
+$rulesSource = Join-Path $repoRoot "plugins\sdd-doc-sync\.sdd-doc-sync-rules.md"
 $pluginTarget = Join-Path $workRoot ".opencode\plugins\sdd-doc-sync-opencode.js"
-$todoPath = Join-Path $workRoot ".sdd-doc-sync.md"
-$statePath = Join-Path $workRoot ".sdd-doc-sync-state.json"
+$pluginRulesTarget = Join-Path $workRoot ".opencode\plugins\.sdd-doc-sync-rules.md"
+$todoRel = ".git/sdd-doc-sync/.sdd-doc-sync.md"
+$stateRel = ".git/sdd-doc-sync/.sdd-doc-sync-state.json"
+$outboxRel = ".git/sdd-doc-sync/.sdd-doc-sync-outbox.jsonl"
+$todoPath = Join-Path $workRoot ($todoRel -replace "/", "\")
+$statePath = Join-Path $workRoot ($stateRel -replace "/", "\")
+$outboxPath = Join-Path $workRoot ($outboxRel -replace "/", "\")
 $summaryJson = Join-Path $workRoot "doc-sync-workflow-summary.json"
 $summaryMd = Join-Path $workRoot "doc-sync-workflow-report.md"
 
@@ -39,6 +45,9 @@ if (!(Test-Path -LiteralPath $configTemplate)) {
 }
 if (!(Test-Path -LiteralPath $pluginSource)) {
   throw "missing OpenCode plugin entry: $pluginSource"
+}
+if (!(Test-Path -LiteralPath $rulesSource)) {
+  throw "missing sdd-doc-sync prompt template: $rulesSource"
 }
 
 $keyName = if ($Provider -eq "deepseek") { "DEEPSEEK_API_KEY" } else { "MINIMAX_API_KEY" }
@@ -256,7 +265,7 @@ function Get-ReadEvidence {
     design = [bool](@($unique | Where-Object { $_ -match "(^|/)design\.md$" }).Count)
     tasks = [bool](@($unique | Where-Object { $_ -match "(^|/)tasks\.md$" }).Count)
     code = [bool](@($unique | Where-Object { $_ -match "^src/.+\.ts$" }).Count)
-    todo = [bool](@($unique | Where-Object { $_ -eq ".sdd-doc-sync.md" }).Count)
+    todo = [bool](@($unique | Where-Object { $_ -eq $script:todoRel -or $_ -eq ".sdd-doc-sync.md" }).Count)
   }
 }
 
@@ -265,12 +274,19 @@ function Snapshot-Tree {
   $paths = @(
     "sdd\changes\checkout-badge\design.md",
     "sdd\changes\checkout-badge\tasks.md",
+    "src\checkoutTypes.ts",
+    "src\badgeRules.ts",
+    "src\badgeRenderer.ts",
     "src\checkoutBadge.ts",
     "src\badgeText.ts",
     "src\index.ts",
     ".sdd-doc-sync-rules.md",
+    ".opencode\plugins\.sdd-doc-sync-rules.md",
     ".sdd-doc-sync.md",
-    ".sdd-doc-sync-state.json"
+    ".sdd-doc-sync-state.json",
+    ".git\sdd-doc-sync\.sdd-doc-sync.md",
+    ".git\sdd-doc-sync\.sdd-doc-sync-state.json",
+    ".git\sdd-doc-sync\.sdd-doc-sync-outbox.jsonl"
   )
   $items = @()
   foreach ($p in $paths) {
@@ -305,6 +321,7 @@ New-Item -ItemType Directory -Force (Join-Path $workRoot "src") | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $workRoot "scripts") | Out-Null
 New-Item -ItemType Directory -Force $opencodeHome | Out-Null
 Copy-Item -LiteralPath $pluginSource -Destination $pluginTarget -Force
+Copy-Item -LiteralPath $rulesSource -Destination $pluginRulesTarget -Force
 
 $packageJson = @"
 {
@@ -317,10 +334,26 @@ $packageJson = @"
 Set-ContentWithRetry -LiteralPath (Join-Path $workRoot "package.json") -Value $packageJson -NoNewline
 
 $rulesText = @'
-- 公共 API 或导出函数签名变化时，必须同步 design.md。
-- 新增用户可见行为或业务规则时，必须同步 tasks.md。
-- 纯重构无需改文档，但要在 .sdd-doc-sync.md 写清“行为不变”的依据。
+[SDD-DOC-SYNC: 待同步评审]
+Real workflow template marker: {{runMarker}}
+收尾前检测到 {{pendingCount}} 个代码文件已改动、文档可能落后，请在结束本回合前逐项评审：
+待评审：
+{{pendingItems}}
+
+评审纪律（你是唯一裁判；下结论前必须先取证，不接受裸判断）。对每个待评审文件，按此结构输出，最后才下结论：
+  1. 读取该代码文件，引用其当前关键实现（具体函数/行为）
+  2. 读取对应 sdd/changes/<change>/design.md 与 tasks.md，引用其当前声明（具体一句/一段）
+  3. 二者是否一致？指出冲突点，或写"经对照无冲突"
+  4. 结论：
+     - 代码领先文档（design/tasks 未反映该实现）→ 直接编辑 design.md / tasks.md 使其同步（这就是本工具的目的）
+     - 一致 / 纯重构 / 无关 → 在 {{todoFile}} 把该行 [ ] 改为 [x]，并在 — 后补一句含第 3 步依据的理由
+
+最终门槛（必做，勿略）：
+  ① 同步文档后你新改动的文件也要重新评审；
+  ② {{todoFile}} 仍有 [ ] 未勾时，不要说"已完成同步"，要说明还剩哪些；
+  ③ 清除待评审项的唯一方式 = 在 {{todoFile}} 把对应行 [ ] 改为 [x] 并附理由（编辑代码不自动清除，也不要手写新增 [ ] 行）。
 '@
+$rulesText = $rulesText.Replace("{{runMarker}}", $marker)
 Set-ContentWithRetry -LiteralPath (Join-Path $workRoot ".sdd-doc-sync-rules.md") -Value $rulesText -NoNewline
 
 $checkScript = @'
@@ -329,13 +362,28 @@ import { join } from "node:path";
 
 const root = process.cwd();
 const src = join(root, "src");
+const required = [
+  "checkoutTypes.ts",
+  "badgeRules.ts",
+  "badgeRenderer.ts",
+  "checkoutBadge.ts",
+  "badgeText.ts",
+  "index.ts",
+];
+
 if (!existsSync(src)) {
   throw new Error("missing src directory");
 }
 
 const files = readdirSync(src).filter((name) => name.endsWith(".ts"));
-if (files.length === 0) {
-  throw new Error("no TypeScript files under src");
+for (const file of required) {
+  if (!existsSync(join(src, file))) {
+    throw new Error(`missing required source file: ${file}`);
+  }
+}
+
+if (files.length < required.length) {
+  throw new Error(`expected at least ${required.length} TypeScript files under src`);
 }
 
 for (const file of files) {
@@ -346,6 +394,27 @@ for (const file of files) {
   if (text.includes("SYNTAX_ERROR_SENTINEL")) {
     throw new Error(`${file} contains synthetic failure marker`);
   }
+}
+
+const combined = files.map((file) => readFileSync(join(src, file), "utf8")).join("\n");
+if (!combined.includes("buildCheckoutBadge")) {
+  throw new Error("missing expected public symbol: buildCheckoutBadge");
+}
+
+if (!["validateOrderTotal", "resolveTier", "isThresholdMet"].some((token) => combined.includes(token))) {
+  throw new Error("missing expected rule-selection or state-computation symbol");
+}
+
+if (!["renderBadgeHtml", "buildBadgeHtml"].some((token) => combined.includes(token))) {
+  throw new Error("missing expected HTML rendering symbol");
+}
+
+if (!["escapeHtml", "generateAriaLabel", "buildBadgeClass"].some((token) => combined.includes(token))) {
+  throw new Error("missing expected text escaping or class-name helper symbol");
+}
+
+if (combined.length < 6000) {
+  throw new Error("source code is too small for the enhanced scenario");
 }
 
 console.log(`checked ${files.length} TypeScript files`);
@@ -359,77 +428,108 @@ try {
   Pop-Location
 }
 
-$config = Get-Content -LiteralPath $configTemplate -Raw -Encoding UTF8
-if ($Provider -eq "minimax") {
-  $config = $config -replace "https://api\.minimax(?:i)?\.com/v1", $minimaxBaseUrl.TrimEnd("/")
-}
 $modelName = if ($Provider -eq "deepseek") { "deepseek/deepseek-chat" } else { "minimax/MiniMax-M2.7" }
-$agentConfig = @"
-  "agent": {
-    "docsync": {
-      "model": "$modelName",
-      "mode": "primary",
-      "permission": "allow",
-      "steps": 50,
-      "temperature": 0,
-      "prompt": "You are running a real OpenCode behavior validation for sdd-doc-sync. Execute the user's local file edits directly. Do not inspect .opencode, .git, provider config, environment variables, or plugin implementation files. If a system or user message contains [SDD-DOC-SYNC, continue the same assistant turn: read .sdd-doc-sync.md, read each pending code file, read the corresponding sdd/changes/*/design.md and tasks.md, decide whether documents need synchronization, then either update design/tasks or mark the exact pending .sdd-doc-sync.md line as [x] with a short evidence-based reason. Do not claim completion while .sdd-doc-sync.md still has [ ] lines."
-    },
-    "build": {
-      "model": "$modelName",
-      "permission": "allow",
-      "steps": 4
-    },
-    "title": {
-      "model": "$modelName",
-      "permission": "allow",
-      "steps": 1
+$providerModelId = if ($Provider -eq "deepseek") { "deepseek-chat" } else { "MiniMax-M2.7" }
+$providerName = if ($Provider -eq "deepseek") { "DeepSeek" } else { "MiniMax" }
+$providerBaseUrl = if ($Provider -eq "deepseek") { "https://api.deepseek.com/v1" } else { $minimaxBaseUrl.TrimEnd("/") }
+$providerContext = if ($Provider -eq "deepseek") { 64000 } else { 204800 }
+$providerOutput = if ($Provider -eq "deepseek") { 8192 } else { 64000 }
+$agentPrompt = "You are running a real OpenCode behavior validation for sdd-doc-sync. Execute the user's local file edits directly. All implementation TypeScript for this validation belongs in repository-root src/*.ts; never create or edit implementation TypeScript under sdd/changes/**/src because sdd/changes is only for design.md and tasks.md. Do not inspect .opencode, provider config, environment variables, or plugin implementation files. Do not inspect .git except the sdd-doc-sync files under $todoRel when the SDD prompt asks for them. Never ask the user a question and never call the question tool; if anything is ambiguous, make a conservative local assumption and continue. If a system or user message contains [SDD-DOC-SYNC, continue the same assistant turn: read the todo file path named by the SDD prompt, read each pending code file, read the corresponding sdd/changes/*/design.md and tasks.md, decide whether documents need synchronization, then either update design/tasks or mark the exact pending todo line as [x] with a short evidence-based reason. After clearing pending items, return to the original user request for this phase. Do not claim completion while $todoRel still has [ ] lines."
+
+$providerModels = [ordered]@{}
+$providerModels[$providerModelId] = [ordered]@{
+  name = $providerModelId
+  tool_call = $true
+  temperature = $true
+  limit = [ordered]@{
+    context = $providerContext
+    output = $providerOutput
+  }
+}
+$providersConfig = [ordered]@{}
+$providersConfig[$Provider] = [ordered]@{
+  npm = "@ai-sdk/openai-compatible"
+  name = $providerName
+  options = [ordered]@{
+    baseURL = $providerBaseUrl
+    apiKey = "{env:$keyName}"
+  }
+  models = $providerModels
+}
+$configObject = [ordered]@{
+  '$schema' = "https://opencode.ai/config.json"
+  model = $modelName
+  small_model = $modelName
+  enabled_providers = @($Provider)
+  default_agent = "docsync"
+  autoupdate = $false
+  share = "disabled"
+  permission = "allow"
+  provider = $providersConfig
+  agent = [ordered]@{
+    docsync = [ordered]@{
+      model = $modelName
+      mode = "primary"
+      permission = "allow"
+      steps = 80
+      temperature = 0
+      prompt = $agentPrompt
+    }
+    build = [ordered]@{
+      model = $modelName
+      permission = "allow"
+      steps = 4
+    }
+    title = [ordered]@{
+      model = $modelName
+      permission = "allow"
+      steps = 1
     }
   }
-"@
-$config = $config -replace '"default_agent"\s*:\s*"[^"]+"', '"default_agent": "docsync"'
-$config = $config -replace '"agent"\s*:\s*\{[\s\S]*\}\s*\n\}', ($agentConfig + "`n}")
+}
+$config = $configObject | ConvertTo-Json -Depth 20
 Set-ContentWithRetry -LiteralPath (Join-Path $workRoot ".opencode\opencode.jsonc") -Value $config -NoNewline
 
 $phases = @(
   [pscustomobject]@{
     id = "P01-design"
     title = "write design.md first"
-    prompt = "Create only sdd/changes/checkout-badge/design.md with heading '# Design'. Design a TypeScript checkout badge feature with exported buildCheckoutBadge(orderTotal, customerTier). The output must include marker '$marker'. Mention base tier labels but do not create tasks or code yet."
+    prompt = "Create only sdd/changes/checkout-badge/design.md with heading '# Design'. Make it a substantial design document for a TypeScript checkout badge module exported as buildCheckoutBadge(orderTotal, customerTier, options?). Include at least these sections: Overview, Goals, Non-goals, User journeys, Public API, Data model, Tier rules, Rendering contract, Accessibility, Error handling, Edge cases, Telemetry-free constraints, Acceptance criteria, and Traceability. The design must include marker '$marker'. Cover base tiers bronze/silver/gold/platinum, free-shipping threshold behavior, and deterministic HTML output. Do not create tasks or code yet."
   },
   [pscustomobject]@{
     id = "P02-tasks"
     title = "write tasks.md second"
-    prompt = "Read sdd/changes/checkout-badge/design.md and create only sdd/changes/checkout-badge/tasks.md with heading '# Tasks'. Add an implementation checklist for the checkout badge feature. Do not create or edit code yet."
+    prompt = "Read sdd/changes/checkout-badge/design.md and create only sdd/changes/checkout-badge/tasks.md with heading '# Tasks'. Make it a substantial implementation plan with sections for Data types, Rule selection, HTML rendering, Public API wiring, Validation, Accessibility, Edge cases, Documentation review, and Manual verification. Include at least 18 checklist items and reference marker '$marker'. Do not create or edit code yet."
   },
   [pscustomobject]@{
     id = "P03-initial-code"
     title = "implement first code"
-    prompt = "Read sdd/changes/checkout-badge/design.md and tasks.md, then implement src/checkoutBadge.ts and src/index.ts. Keep marker '$marker' in returned badge strings. If sdd-doc-sync asks for review at the end, complete that review before final response."
+    prompt = "Read sdd/changes/checkout-badge/design.md and tasks.md, then implement a multi-file TypeScript module with these repository-root files only: src/checkoutTypes.ts, src/badgeRules.ts, src/badgeRenderer.ts, src/checkoutBadge.ts, and src/index.ts. Do not create TypeScript files under sdd/changes/checkout-badge/src or any other SDD directory. Do not create smoke-test.mjs or any root-level code file outside src. Put real logic in each file, not placeholders. Include typed customer tiers, validation, threshold rules, deterministic HTML rendering, escaping helpers, accessibility attributes, and exported buildCheckoutBadge(orderTotal, customerTier, options?). Keep marker '$marker' in returned badge strings. Aim for at least 120 lines of TypeScript across the source files. If sdd-doc-sync asks for review at the end, complete that review before final response, then return to the original implementation task if anything remains."
   },
   [pscustomobject]@{
     id = "P04-code-leading-discount"
     title = "code leads docs"
-    prompt = "Modify src/checkoutBadge.ts directly so totals >= 200 get a high-value badge segment. Do not edit SDD docs before the code change. If sdd-doc-sync asks for review, decide whether design.md or tasks.md must be synchronized to this new behavior and do it if needed."
+    prompt = "First clear any existing $todoRel pending items if present. Then modify repository-root code directly so totals >= 200 get a high-value badge segment and totals >= 500 get an executive-review hint. Prefer editing src/badgeRules.ts and src/badgeRenderer.ts, and only touch src/checkoutBadge.ts if the API wiring needs it. Do not create TypeScript files under sdd/changes/checkout-badge/src or any other SDD directory. Do not create smoke-test.mjs or root-level code files outside src. Do not edit SDD docs before the code change. If sdd-doc-sync asks for review, decide whether design.md or tasks.md must be synchronized to this new behavior and do it if needed. Do not ask questions."
   },
   [pscustomobject]@{
     id = "P05-doc-only-vip"
     title = "docs lead code"
-    prompt = "Revise only sdd/changes/checkout-badge/design.md and tasks.md to add VIP customer tier wording. This phase is docs only; do not edit code unless sdd-doc-sync explicitly requests it."
+    prompt = "First clear any existing $todoRel pending items if present, then return to this docs-only request. Revise only sdd/changes/checkout-badge/design.md and tasks.md to add VIP customer tier behavior, a seasonal campaign label option, and a compact rendering mode. Use these concrete assumptions without asking: VIP uses a purple accent and priority message, seasonalCampaignLabel is an optional string displayed when provided, compact mode removes progress details but keeps tier/message/marker. This phase is docs only; do not edit code unless sdd-doc-sync explicitly requests it."
   },
   [pscustomobject]@{
     id = "P06-code-from-docs"
     title = "code catches up to docs"
-    prompt = "Read the updated design.md and tasks.md, then modify src/checkoutBadge.ts so VIP tier behavior matches the docs. Keep marker '$marker'. If sdd-doc-sync asks for review, read code/design/tasks and mark or synchronize every pending item."
+    prompt = "First clear any existing $todoRel pending items if present. Then read the updated design.md and tasks.md and modify the repository-root TypeScript source so VIP tier behavior, seasonal campaign label option, and compact rendering mode match the docs. If the docs are still missing one of those details, update design.md/tasks.md using the assumptions from P05 before changing code; do not ask questions. Update the right repository-root files among src/checkoutTypes.ts, src/badgeRules.ts, src/badgeRenderer.ts, src/checkoutBadge.ts, and src/index.ts. Do not create or edit TypeScript under sdd/changes/checkout-badge/src. Keep marker '$marker'. If sdd-doc-sync asks for review, read code/design/tasks and mark or synchronize every pending item."
   },
   [pscustomobject]@{
     id = "P07-benign-refactor"
     title = "benign refactor"
-    prompt = "Create src/badgeText.ts and refactor src/checkoutBadge.ts to use it without changing visible behavior, marker '$marker', high-value behavior, or VIP behavior. If sdd-doc-sync asks for review, record an evidence-based no-doc-change rationale."
+    prompt = "First clear any existing $todoRel pending items if present. Then create repository-root src/badgeText.ts and refactor the repository-root code to centralize labels and class-name helpers without changing visible behavior, marker '$marker', high-value behavior, executive-review hint, VIP behavior, seasonal label, or compact mode. If useful, adjust src/badgeRenderer.ts and src/badgeRules.ts. Do not create or edit TypeScript under sdd/changes/checkout-badge/src. If sdd-doc-sync asks for review, record an evidence-based no-doc-change rationale. Do not ask questions."
   },
   [pscustomobject]@{
     id = "P08-final-check"
     title = "final review and report"
-    prompt = "Make one final small code cleanup in src/index.ts, then handle any sdd-doc-sync review. Before final response, read .sdd-doc-sync.md and report whether any [ ] pending lines remain, naming exact paths if present."
+    prompt = "First clear any existing $todoRel pending items if present. Then make one final small code cleanup in repository-root src/index.ts, run npm run check, then handle any sdd-doc-sync review. Do not create or edit TypeScript under sdd/changes/checkout-badge/src. Do not edit scripts/check.mjs; treat it as the fixed validation harness. Before final response, read $todoRel and report whether any [ ] pending lines remain, naming exact paths if present. Do not ask questions."
   }
 )
 
@@ -440,8 +540,8 @@ $env:USERPROFILE = $opencodeHome
 
 $activeSessionId = $null
 $phaseResults = @()
-$phaseTimeoutMs = if ($Provider -eq "minimax") { 240000 } else { 180000 }
-$phaseMaxAttempts = if ($Provider -eq "minimax") { 2 } else { 1 }
+$phaseTimeoutMs = 480000
+$phaseMaxAttempts = 2
 try {
   for ($phaseIndex = 0; $phaseIndex -lt $phases.Count; $phaseIndex++) {
     $phase = $phases[$phaseIndex]
@@ -494,8 +594,10 @@ try {
 
     $outText = Read-Text $outLog
     $errText = Read-Text $errLog
+    $allOutText = (@($attempts | ForEach-Object { Read-Text $_.stdout }) -join "`n")
+    $allErrText = (@($attempts | ForEach-Object { Read-Text $_.stderr }) -join "`n")
     if (!$activeSessionId) {
-      $activeSessionId = Extract-SessionId $outText
+      $activeSessionId = Extract-SessionId $allOutText
     }
 
     $todoText = Read-Text $todoPath
@@ -503,7 +605,7 @@ try {
     $afterChecked = Get-CheckedPaths $todoText
     $pendingDelta = Compare-StringSets $beforePending $afterPending
     $checkedDelta = Compare-StringSets $beforeChecked $afterChecked
-    $readEvidence = Get-ReadEvidence -Text $outText -Root $workRoot
+    $readEvidence = Get-ReadEvidence -Text $allOutText -Root $workRoot
     $stateText = Read-Text $statePath
     $phaseResults += [pscustomobject]@{
       id = $phase.id
@@ -515,7 +617,8 @@ try {
       timedOut = $timedOut
       noOutput = $noOutput
       sessionId = $activeSessionId
-      docSyncPromptCount = (Count-Matches $outText "\[SDD-DOC-SYNC") + (Count-Matches $errText "service=sdd-doc-sync-opencode.*(processed Stop continuation|sent automatic Stop review continuation)")
+      docSyncPromptCount = (Count-Matches $allOutText "\[SDD-DOC-SYNC") + (Count-Matches $allErrText "service=sdd-doc-sync-opencode.*(processed Stop continuation|sent automatic Stop review continuation)")
+      questionAskCount = (Count-Matches $allOutText "service=question.*asking|type=question\.asked|question\.asked") + (Count-Matches $allErrText "service=question.*asking|type=question\.asked|question\.asked")
       pendingTodoCount = @($afterPending).Count
       checkedTodoCount = @($afterChecked).Count
       pendingAdded = @($pendingDelta.added)
@@ -523,7 +626,7 @@ try {
       checkedAdded = @($checkedDelta.added)
       readEvidence = $readEvidence
       lastPromptStateBytes = $stateText.Length
-      opencodeErrorCount = Count-Matches $errText "(?i)\b(error|exception|failed)\b"
+      opencodeErrorCount = Count-Matches $allErrText "(?i)\b(error|exception|failed)\b"
       stdout = $outLog
       stderr = $errLog
     }
@@ -548,6 +651,7 @@ $summary = [pscustomobject]@{
   sessionIds = @($phaseResults | Select-Object -ExpandProperty sessionId -Unique)
   phases = $phaseResults
   finalTodo = Read-Text $todoPath
+  finalOutbox = Read-Text $outboxPath
   files = Snapshot-Tree $workRoot
 }
 Set-ContentWithRetry -LiteralPath $summaryJson -Value ($summary | ConvertTo-Json -Depth 12) -NoNewline
@@ -566,11 +670,11 @@ $report += "- PhaseMaxAttempts: $phaseMaxAttempts"
 $report += ""
 $report += "## Phase Summary"
 $report += ""
-$report += "| Phase | Session | Attempts | Exit | Timed Out | Empty Output | SDD Prompt Count | Pending Todo | Checked Todo | Pending Added | Pending Cleared | Checked Added | Read Evidence | Error Words |"
-$report += "| --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | ---: |"
+$report += "| Phase | Session | Attempts | Exit | Timed Out | Empty Output | SDD Prompt Count | Question Ask Count | Pending Todo | Checked Todo | Pending Added | Pending Cleared | Checked Added | Read Evidence | Error Words |"
+$report += "| --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: |"
 foreach ($r in $phaseResults) {
   $readSummary = "design=$($r.readEvidence.design); tasks=$($r.readEvidence.tasks); code=$($r.readEvidence.code); todo=$($r.readEvidence.todo)"
-  $report += "| $($r.id) $($r.title) | $($r.sessionId) | $($r.attemptCount) | $($r.exitCode) | $($r.timedOut) | $($r.noOutput) | $($r.docSyncPromptCount) | $($r.pendingTodoCount) | $($r.checkedTodoCount) | $((@($r.pendingAdded) -join '<br>')) | $((@($r.pendingCleared) -join '<br>')) | $((@($r.checkedAdded) -join '<br>')) | $readSummary | $($r.opencodeErrorCount) |"
+  $report += "| $($r.id) $($r.title) | $($r.sessionId) | $($r.attemptCount) | $($r.exitCode) | $($r.timedOut) | $($r.noOutput) | $($r.docSyncPromptCount) | $($r.questionAskCount) | $($r.pendingTodoCount) | $($r.checkedTodoCount) | $((@($r.pendingAdded) -join '<br>')) | $((@($r.pendingCleared) -join '<br>')) | $((@($r.checkedAdded) -join '<br>')) | $readSummary | $($r.opencodeErrorCount) |"
 }
 $report += ""
 $report += "## Read Evidence Details"
@@ -593,9 +697,15 @@ $report += '```markdown'
 $report += (Read-Text $todoPath)
 $report += '```'
 $report += ""
+$report += "## Final Outbox"
+$report += ""
+$report += '```jsonl'
+$report += (Read-Text $outboxPath)
+$report += '```'
+$report += ""
 $report += "## Final Files"
 foreach ($file in (Snapshot-Tree $workRoot)) {
-  if ($file.path -eq ".sdd-doc-sync.md" -or $file.path -eq ".sdd-doc-sync-state.json") {
+  if ($file.path -eq ".sdd-doc-sync.md" -or $file.path -eq ".sdd-doc-sync-state.json" -or $file.path -match "^\.git/sdd-doc-sync/") {
     continue
   }
   $report += ""
@@ -616,7 +726,7 @@ Write-Output "SESSION_IDS=$((@($phaseResults | Select-Object -ExpandProperty ses
 Write-Output "SUMMARY_JSON=$summaryJson"
 Write-Output "SUMMARY_MD=$summaryMd"
 Write-Output "--- Phase Summary ---"
-$phaseResults | Select-Object id,title,sessionId,attemptCount,exitCode,timedOut,noOutput,docSyncPromptCount,pendingTodoCount,checkedTodoCount,opencodeErrorCount | Format-Table -AutoSize
+$phaseResults | Select-Object id,title,sessionId,attemptCount,exitCode,timedOut,noOutput,docSyncPromptCount,questionAskCount,pendingTodoCount,checkedTodoCount,opencodeErrorCount | Format-Table -AutoSize
 Write-Output "--- Final Todo ---"
 if (Test-Path -LiteralPath $todoPath) {
   Get-Content -LiteralPath $todoPath -Encoding UTF8
