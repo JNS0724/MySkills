@@ -19,7 +19,6 @@ $opencodeEntry = Join-Path $root "node_modules\opencode-ai\bin\opencode"
 $phaseRunner = Join-Path $root "scripts\run-opencode-phase.mjs"
 $configTemplate = Join-Path $root ".opencode\opencode.$Provider.jsonc.example"
 $pluginSource = Join-Path $repoRoot "plugins\sdd-doc-sync\sdd-doc-sync-opencode.js"
-$coreSource = Join-Path $repoRoot "plugins\sdd-doc-sync\sdd-doc-sync.js"
 $pluginTarget = Join-Path $workRoot ".opencode\plugins\sdd-doc-sync-opencode.js"
 $todoPath = Join-Path $workRoot ".sdd-doc-sync.md"
 $statePath = Join-Path $workRoot ".sdd-doc-sync-state.json"
@@ -40,9 +39,6 @@ if (!(Test-Path -LiteralPath $configTemplate)) {
 }
 if (!(Test-Path -LiteralPath $pluginSource)) {
   throw "missing OpenCode plugin entry: $pluginSource"
-}
-if (!(Test-Path -LiteralPath $coreSource)) {
-  throw "missing sdd-doc-sync core: $coreSource"
 }
 
 $keyName = if ($Provider -eq "deepseek") { "DEEPSEEK_API_KEY" } else { "MINIMAX_API_KEY" }
@@ -135,7 +131,6 @@ function Invoke-OpenCodeRun {
   $envMap = [ordered]@{
     HOME = $env:HOME
     USERPROFILE = $env:USERPROFILE
-    SDD_DOC_SYNC_CORE = $env:SDD_DOC_SYNC_CORE
   }
   $request = [ordered]@{
     executable = "node"
@@ -440,10 +435,8 @@ $phases = @(
 
 $previousHome = $env:HOME
 $previousUserProfile = $env:USERPROFILE
-$previousCore = $env:SDD_DOC_SYNC_CORE
 $env:HOME = $opencodeHome
 $env:USERPROFILE = $opencodeHome
-$env:SDD_DOC_SYNC_CORE = $coreSource
 
 $activeSessionId = $null
 $phaseResults = @()
@@ -542,11 +535,6 @@ try {
 } finally {
   $env:HOME = $previousHome
   $env:USERPROFILE = $previousUserProfile
-  if ($null -eq $previousCore) {
-    Remove-Item Env:\SDD_DOC_SYNC_CORE -ErrorAction SilentlyContinue
-  } else {
-    $env:SDD_DOC_SYNC_CORE = $previousCore
-  }
 }
 
 $summary = [pscustomobject]@{

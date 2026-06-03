@@ -18,7 +18,7 @@
 
 - ❌ 不注入 git diff（让模型自己读文件）
 - ❌ 不做内容哈希 / ledger（清除靠你/模型勾选复选框，不靠哈希）
-- ❌ 无第三方依赖、无构建步骤；Claude Code / OpenCode 各一个入口，核心逻辑复用同一个 `sdd-doc-sync.js`
+- ❌ 无第三方依赖、无构建步骤；Claude Code / OpenCode 各自都是可单独拷贝安装的入口文件
 
 需要哈希追踪、跨版本防误清、change-note 线索、多平台等更强能力，见隔壁 [`sdd-review-ledger`](../sdd-review-ledger)。本插件是验证"用户是否关注这个场景"的最小试水。
 
@@ -53,18 +53,17 @@
 
 ## 安装（OpenCode）
 
-OpenCode 入口是 `sdd-doc-sync-opencode.js`，它会复用 `sdd-doc-sync.js` 里的核心逻辑。
+OpenCode 入口是独立文件 `sdd-doc-sync-opencode.js`。安装时只需要拷贝这一个文件，不需要同时拷贝 Claude Code 入口或设置额外环境变量。
 
 项目级安装示例：
 
 ```powershell
 New-Item -ItemType Directory -Force .opencode\plugins
 Copy-Item E:\coding\sdd\SDD-plugins\plugins\sdd-doc-sync\sdd-doc-sync-opencode.js .opencode\plugins\sdd-doc-sync-opencode.js -Force
-$env:SDD_DOC_SYNC_CORE = "E:\coding\sdd\SDD-plugins\plugins\sdd-doc-sync\sdd-doc-sync.js"
 opencode
 ```
 
-`SDD_DOC_SYNC_CORE` 用来指向原来的 Claude/core 文件，这样 `.opencode/plugins/` 里只需要放 OpenCode 入口文件。源码目录内开发或测试时，如果两个文件同目录，也可以不设这个变量，入口会默认 `require("./sdd-doc-sync")`。
+插件会在当前工作目录向上寻找 SDD 工程标记（`sdd/changes` 或 `.sdd/changes`），并在工程根目录维护 `.sdd-doc-sync.md` 与 `.sdd-doc-sync-state.json`。
 
 OpenCode 映射关系：
 

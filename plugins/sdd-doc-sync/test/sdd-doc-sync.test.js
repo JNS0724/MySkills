@@ -334,6 +334,49 @@ test("OpenCode chat.message + edit tool registers a code file with the user prom
   }
 })
 
+test("OpenCode adapter works after copying only the plugin file", async () => {
+  const root = mkSddRepo()
+  const pluginDir = fs.mkdtempSync(path.join(os.tmpdir(), "sdd-doc-sync-opencode-only-"))
+  try {
+    const copied = path.join(pluginDir, "sdd-doc-sync-opencode.js")
+    fs.copyFileSync(path.join(__dirname, "..", "sdd-doc-sync-opencode.js"), copied)
+    assert.strictEqual(fs.existsSync(path.join(pluginDir, "sdd-doc-sync.js")), false)
+
+    const mod = await import(`${pathToFileURL(copied).href}?standalone=${Date.now()}`)
+    const prompts = []
+    const hooks = await mod.SddDocSyncOpenCode({
+      directory: root,
+      worktree: root,
+      client: {
+        app: { log: async () => {} },
+        session: { prompt: async (payload) => prompts.push(payload) },
+      },
+    })
+
+    await hooks["chat.message"](
+      { sessionID: "session-standalone", message: { role: "user", content: "standalone install" } },
+      { message: { role: "user" }, parts: [{ type: "text", text: "standalone install" }] }
+    )
+    await hooks["tool.execute.after"](
+      {
+        tool: "write",
+        sessionID: "session-standalone",
+        callID: "call-standalone",
+        args: { filePath: "src/standalone.ts" },
+      },
+      { title: "written", output: "created src/standalone.ts" }
+    )
+
+    const todo = fs.readFileSync(mod._private.todoPathFor(root), "utf8")
+    assert.ok(todo.includes("- [ ] src/standalone.ts"))
+    assert.ok(todo.includes("Write"))
+    assert.ok(todo.includes("standalone install"))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+    fs.rmSync(pluginDir, { recursive: true, force: true })
+  }
+})
+
 test("OpenCode adapter extracts apply_patch paths and records them as edits", async () => {
   const root = mkSddRepo()
   const patchText = [

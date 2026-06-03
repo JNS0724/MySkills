@@ -2,15 +2,337 @@ import { createRequire as __sddCreateRequire } from "node:module"
 
 const require = __sddCreateRequire(import.meta.url)
 
+const fs = require("node:fs")
 const path = require("node:path")
 
-const CORE_MODULE = process.env.SDD_DOC_SYNC_CORE
-  ? path.resolve(process.env.SDD_DOC_SYNC_CORE)
-  : "./sdd-doc-sync"
-const {
-  findRepoRoot,
-  handleEvent,
-} = require(CORE_MODULE)
+const TODO_FILE = ".sdd-doc-sync.md"
+const STATE_FILE = ".sdd-doc-sync-state.json"
+const RULES_FILE = ".sdd-doc-sync-rules.md"
+const RULES_ENV = "SDD_DOC_SYNC_RULES_FILE"
+const RULES_MAX_BYTES = 4096
+const HEADER = "# SDD 文档同步评审（自动维护：代码改动后在此登记；勾选 [x] = 已评审/已同步）"
+const SANITIZE_MAX = 300
+const LAST_PROMPT_MAX = 120
+const TODO_LINE = /^- \[([ x])\] (\S+)(?: — (.*))?$/
+const CHANGE_PARENTS = ["sdd/changes", ".sdd/changes"]
+const DOC_NAMES = ["proposal.md", "design.md", "tasks.md"]
+const EDIT_TOOLS = /^(Edit|Write|MultiEdit)$/i
+const CODE_EXT = new Set([
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java",
+  ".kt", ".kts", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".rb", ".php",
+  ".swift", ".scala", ".m", ".sh", ".bash", ".zsh", ".sql", ".vue", ".svelte",
+])
+
+const toPosix = (p) => String(p == null ? "" : p).replace(/\\/g, "/")
+
+const sanitize = (s) => {
+  const input = String(s == null ? "" : s)
+  let out = ""
+  for (const ch of input) {
+    const code = ch.codePointAt(0)
+    const isCtrl = code <= 0x1f || code === 0x7f
+    const isBidi =
+      (code >= 0x200e && code <= 0x200f) ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069)
+    out += isCtrl || isBidi ? " " : ch
+  }
+  return out.trim().slice(0, SANITIZE_MAX)
+}
+
+const sanitizeLine = (s) => {
+  const input = String(s == null ? "" : s)
+  let out = ""
+  for (const ch of input) {
+    const code = ch.codePointAt(0)
+    const isCtrl = code <= 0x1f || code === 0x7f
+    const isBidi =
+      (code >= 0x200e && code <= 0x200f) ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069)
+    out += isCtrl || isBidi ? " " : ch
+  }
+  return out.replace(/\s+$/u, "").slice(0, SANITIZE_MAX)
+}
+
+const byteSlice = (s, maxBytes) => {
+  const str = String(s == null ? "" : s)
+  if (Buffer.byteLength(str, "utf8") <= maxBytes) return str
+  let bytes = 0
+  let out = ""
+  for (const ch of str) {
+    const b = Buffer.byteLength(ch, "utf8")
+    if (bytes + b > maxBytes) break
+    bytes += b
+    out += ch
+  }
+  return out
+}
+
+const isCodePath = (p) => {
+  const posix = toPosix(p).toLowerCase()
+  if (!posix || posix.endsWith(".md")) return false
+  if (posix.startsWith("sdd/") || posix.startsWith(".sdd/") || posix.includes("/sdd/")) return false
+  const dot = posix.lastIndexOf(".")
+  if (dot < 0) return false
+  return CODE_EXT.has(posix.slice(dot))
+}
+
+const parseTodo = (text) => {
+  const items = []
+  for (const line of String(text == null ? "" : text).split(/\r?\n/)) {
+    const m = TODO_LINE.exec(line)
+    if (!m) continue
+    items.push({ checked: m[1] === "x", path: m[2], reason: (m[3] || "").trim() })
+  }
+  return items
+}
+
+const pendingItems = (text) => parseTodo(text).filter((it) => !it.checked)
+const ensureHeader = (lines) => (lines.some((l) => l.startsWith("# ")) ? lines : [HEADER, "", ...lines])
+
+const splitLines = (text) => {
+  const lines = String(text == null ? "" : text).split(/\r?\n/)
+  if (lines.length && lines[lines.length - 1] === "") lines.pop()
+  return lines
+}
+
+const joinTodo = (lines) => `${lines.join("\n")}\n`
+
+const upsertPending = (text, rawPath, rawReason) => {
+  const p = sanitize(rawPath)
+  const original = String(text == null ? "" : text)
+  if (!p) return original
+  const reason = sanitize(rawReason)
+  const lines = splitLines(original)
+  let checkedIdx = -1
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = TODO_LINE.exec(lines[i])
+    if (!m || m[2] !== p) continue
+    if (m[1] === " ") return original
+    if (checkedIdx === -1) checkedIdx = i
+  }
+  const newLine = `- [ ] ${p}${reason ? ` — ${reason}` : ""}`
+  if (checkedIdx >= 0) {
+    const next = lines.slice()
+    next[checkedIdx] = newLine
+    return joinTodo(ensureHeader(next))
+  }
+  return joinTodo(ensureHeader([...lines, newLine]))
+}
+
+const buildRulesSegment = (rules) => {
+  if (!rules || !Array.isArray(rules.lines) || rules.lines.length === 0) return []
+  const seg = [
+    "",
+    `本项目附加评审要求（来自 ${rules.relPath}，必须逐条评估；是否偏差仍由你判断）:`,
+    ...rules.lines.map((l) => `  ${l}`),
+  ]
+  if (rules.truncated) seg.push(`  （规则文件超长，已截断；完整内容见 ${rules.relPath}）`)
+  return seg
+}
+
+const buildStopPrompt = (items, rules) => {
+  const list = items.map((it) => {
+    const reason = sanitize(it.reason)
+    return `  - ${sanitize(it.path)}${reason ? ` — ${reason}` : ""}`
+  })
+  return [
+    "[SDD-DOC-SYNC: 待同步评审]",
+    `收尾前检测到 ${items.length} 个代码文件已改动，文档可能落后。请在结束前逐项评审。`,
+    "待评审：",
+    ...list,
+    ...buildRulesSegment(rules),
+    "",
+    "评审纪律：你是唯一裁判；下结论前必须先取证，不接受裸判断。对每个待评审文件按此结构处理：",
+    "  1. 读取该代码文件，引用具体关键实现（函数/行为）。",
+    "  2. 读取对应 sdd/changes/<change>/design.md 和 tasks.md，引用当前声明。",
+    "  3. 判断代码与文档是否一致，指出冲突点，或写“经对照无冲突”。",
+    "  4. 结论：",
+    "     - 代码领先文档：直接编辑 design.md / tasks.md 使其同步。",
+    "     - 一致 / 纯重构 / 无关：在 .sdd-doc-sync.md 把该行 [ ] 改为 [x]，并在 — 后补一条包含第 3 步依据的理由。",
+    "",
+    "最终门槛（必须做到）：",
+    "  1. 同步文档后，你新改动的文件也要重新评审。",
+    "  2. .sdd-doc-sync.md 仍有 [ ] 时，不要说已经完成同步，要说明还剩哪些。",
+    "  3. 清除待评审项的唯一方式 = 在 .sdd-doc-sync.md 把对应行 [ ] 改为 [x] 并附理由。",
+  ].join("\n")
+}
+
+const editedPathFromEvent = (event) => {
+  const ti = (event && event.tool_input) || {}
+  if (ti.file_path) return ti.file_path
+  if (Array.isArray(ti.edits) && ti.edits.length && ti.edits[0] && ti.edits[0].file_path) {
+    return ti.edits[0].file_path
+  }
+  return undefined
+}
+
+const existsDir = (p) => {
+  try {
+    return fs.statSync(p).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+const findRepoRoot = (start) => {
+  let dir = path.resolve(start || ".")
+  for (let i = 0; i < 50; i += 1) {
+    if (existsDir(path.join(dir, ".git")) || existsDir(path.join(dir, "sdd")) || existsDir(path.join(dir, ".sdd"))) {
+      return dir
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return path.resolve(start || ".")
+}
+
+const discoverChangeDirs = (repoRoot) => {
+  const out = []
+  for (const parent of CHANGE_PARENTS) {
+    const base = path.join(repoRoot, parent)
+    let entries
+    try {
+      entries = fs.readdirSync(base, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue
+      const abs = path.join(base, e.name)
+      const hasDoc = DOC_NAMES.some((n) => {
+        try {
+          return fs.statSync(path.join(abs, n)).isFile()
+        } catch {
+          return false
+        }
+      })
+      if (hasDoc) out.push(toPosix(path.relative(repoRoot, abs)))
+    }
+  }
+  return out.sort()
+}
+
+const isSddProject = (repoRoot) => discoverChangeDirs(repoRoot).length > 0
+const todoPathFor = (repoRoot) => path.join(repoRoot, TODO_FILE)
+const statePathFor = (repoRoot) => path.join(repoRoot, STATE_FILE)
+
+const readFileSafe = (file) => {
+  try {
+    return fs.readFileSync(file, "utf8")
+  } catch {
+    return ""
+  }
+}
+
+const writeFileAtomic = (file, text) => {
+  const tmp = `${file}.tmp.${process.pid}`
+  try {
+    fs.writeFileSync(tmp, text)
+    try {
+      fs.renameSync(tmp, file)
+    } catch (error) {
+      if (error && (error.code === "EEXIST" || error.code === "EPERM")) {
+        try {
+          fs.unlinkSync(file)
+        } catch {
+          /* ignore */
+        }
+        fs.renameSync(tmp, file)
+      } else {
+        throw error
+      }
+    }
+    return true
+  } catch {
+    try {
+      fs.unlinkSync(tmp)
+    } catch {
+      /* ignore */
+    }
+    return false
+  }
+}
+
+const loadLastPrompt = (repoRoot) => {
+  try {
+    const data = JSON.parse(fs.readFileSync(statePathFor(repoRoot), "utf8"))
+    return typeof data.lastPrompt === "string" ? data.lastPrompt : ""
+  } catch {
+    return ""
+  }
+}
+
+const saveLastPrompt = (repoRoot, prompt) => {
+  writeFileAtomic(statePathFor(repoRoot), JSON.stringify({ lastPrompt: sanitize(prompt).slice(0, LAST_PROMPT_MAX) }))
+}
+
+const rulesPathFor = (repoRoot, env = process.env) => {
+  const override = String((env && env[RULES_ENV]) || "").trim()
+  if (override) return path.isAbsolute(override) ? override : path.join(repoRoot, override)
+  return path.join(repoRoot, RULES_FILE)
+}
+
+const loadRules = (repoRoot, env = process.env) => {
+  const abs = rulesPathFor(repoRoot, env)
+  let raw
+  try {
+    raw = fs.readFileSync(abs, "utf8")
+  } catch {
+    return null
+  }
+  if (!raw || !raw.trim()) return null
+  const truncated = Buffer.byteLength(raw, "utf8") > RULES_MAX_BYTES
+  const body = truncated ? byteSlice(raw, RULES_MAX_BYTES) : raw
+  const lines = body.split(/\r?\n/).map(sanitizeLine)
+  while (lines.length && lines[lines.length - 1] === "") lines.pop()
+  if (lines.length === 0) return null
+  let relPath
+  try {
+    relPath = toPosix(path.relative(repoRoot, abs))
+  } catch {
+    relPath = RULES_FILE
+  }
+  if (!relPath || relPath.startsWith("..")) relPath = toPosix(abs)
+  return { relPath: sanitize(relPath), lines, truncated }
+}
+
+const handleEvent = (event, repoRoot, env = process.env) => {
+  const hook = (event && (event.hook_event_name || event.hookEventName)) || ""
+  if (!isSddProject(repoRoot)) return null
+
+  if (hook === "UserPromptSubmit") {
+    saveLastPrompt(repoRoot, (event && (event.prompt || event.promptText)) || "")
+    return null
+  }
+
+  if (hook === "PostToolUse") {
+    const tool = (event && event.tool_name) || ""
+    if (!EDIT_TOOLS.test(tool)) return null
+    const edited = editedPathFromEvent(event)
+    if (!edited) return null
+    const rel = toPosix(path.isAbsolute(edited) ? path.relative(repoRoot, edited) : edited)
+    if (!rel || rel.startsWith("..") || !isCodePath(rel)) return null
+    const last = loadLastPrompt(repoRoot)
+    const reason = `${tool}${last ? ` · ${last}` : ""}`
+    const file = todoPathFor(repoRoot)
+    const before = readFileSafe(file)
+    const after = upsertPending(before, rel, reason)
+    if (after !== before) writeFileAtomic(file, after)
+    return null
+  }
+
+  if (hook === "Stop") {
+    if (event && (event.stop_hook_active || event.stopHookActive)) return null
+    const items = pendingItems(readFileSafe(todoPathFor(repoRoot)))
+    if (items.length === 0) return null
+    return { decision: "block", reason: buildStopPrompt(items, loadRules(repoRoot, env)) }
+  }
+
+  return null
+}
 
 const PLUGIN_NAME = "sdd-doc-sync-opencode"
 const TOOL_INPUT_CACHE_TTL_MS = 5 * 60 * 1000
@@ -417,28 +739,44 @@ const SddDocSyncOpenCode = async (ctx = {}) => {
 }
 
 const privateApi = Object.assign(async () => ({}), {
+  buildRulesSegment,
   buildPostToolUseInput,
   buildPromptInput,
   buildStopInput,
+  buildStopPrompt,
   cacheToolInput,
   claudeToolName,
   contentText,
+  discoverChangeDirs,
+  editedPathFromEvent,
   extractToolArgs,
+  findRepoRoot,
   getSessionID,
   getToolCallID,
   getToolFilePath,
+  handleEvent,
+  isCodePath,
+  isSddProject,
   isUserChatMessage,
   isWriteTool,
+  loadRules,
   normalizeCwd,
   normalizeIdleEvent,
   normalizeToolArgs,
   normalizeToolName,
+  parseTodo,
   patchFilePath,
+  pendingItems,
   promptSession,
   promptSessionCompat,
   runHookInput,
+  rulesPathFor,
+  sanitize,
   shouldHandleIdle,
   shouldInjectStopPrompt,
+  statePathFor,
   takeCachedToolInput,
+  todoPathFor,
+  upsertPending,
 })
 export { SddDocSyncOpenCode, privateApi as _private }
